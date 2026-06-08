@@ -2722,7 +2722,7 @@ class BluRayDumperWindow(QMainWindow):
         self.log_output.setText('Creating AVCHD ISO...')
         QApplication.processEvents()
         try:
-            cmd = ['genisoimage', '-udf']
+            cmd = ['genisoimage', '-iso-level', '4', '-udf']
             if self._udf_revision_supported():
                 cmd += ['-udf-revision', '0x0200']
             cmd += ['-V', vol_id, '-volset', vol_id,
