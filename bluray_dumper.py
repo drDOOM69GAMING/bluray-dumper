@@ -798,9 +798,24 @@ class CompressWorker(QThread):
                '--audio-lang-list', 'eng', '--first-audio']
 
         if self.target_bytes > 0:
-            target_mb = max(1, int(self.target_bytes * 0.92 / (1024 * 1024)))
-            cmd += ['--size', str(target_mb)]
-            log.info('Compression targeting %d MB (%d bytes)', target_mb, self.target_bytes)
+            duration = 0
+            try:
+                r = subprocess.run(
+                    ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                     '-of', 'csv=p=0', str(main_movie)],
+                    capture_output=True, text=True, timeout=30)
+                duration = float(r.stdout.strip())
+            except Exception:
+                pass
+            if duration > 0:
+                total_kbps = int(self.target_bytes * 8 / duration / 1000)
+                video_kbps = max(100, int((total_kbps - 448) * 0.95))
+                cmd += ['--vb', str(video_kbps), '--two-pass']
+                log.info('Compression target: %d bytes, video bitrate %d kbps',
+                         self.target_bytes, video_kbps)
+            else:
+                log.warning('Could not determine duration, falling back to CRF 22')
+                cmd += ['--quality', '22']
         else:
             cmd += ['--quality', '22']
         log.info('Starting compression: %s', ' '.join(cmd))
@@ -2524,8 +2539,21 @@ class BluRayDumperWindow(QMainWindow):
             QMessageBox.critical(self, 'Compression Failed', msg)
             log.error('Compression failed: %s', msg)
         else:
-            self.status_label.setText('Compression complete')
             mkv_path = Path(self.compress_worker.output_path)
+
+            if not mkv_path.is_file() or mkv_path.stat().st_size < 10 * 1024 * 1024:
+                log.error('HandBrakeCLI reported success but no valid output at %s', mkv_path)
+                self.status_label.setText('Compression failed')
+                self.log_output.setText(
+                    'HandBrakeCLI reported success but created no output.\n'
+                    'The --size option may not be supported by this version.')
+                QMessageBox.critical(self, 'Compression Failed',
+                    'HandBrakeCLI exited with code 0 but did not produce a valid MKV.\n'
+                    'Check that your HandBrakeCLI version supports --vb / two-pass,\n'
+                    'or try updating HandBrakeCLI. See log for details.')
+                return
+
+            self.status_label.setText('Compression complete')
             self.log_output.setText('Compressed MKV created.')
 
             if tool_available('ffmpeg') and self._is_dvd_target(self.compress_target):
