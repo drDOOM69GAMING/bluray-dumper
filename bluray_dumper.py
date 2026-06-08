@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sys, os, struct, subprocess, time, shutil, signal, logging, traceback, hashlib, sqlite3, json, ast
+import sys, os, struct, subprocess, time, shutil, signal, logging, traceback, hashlib, sqlite3, json, ast, glob, faulthandler, threading, platform
 from pathlib import Path
 from datetime import timedelta
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -406,6 +406,19 @@ def sanitize_filename(name):
     return safe.strip() or 'Untitled_Bluray'
 
 
+def _write_crash_dump(context, exc_info=None):
+    try:
+        crash_dump = Path.home() / 'bluray_dumper_crash.log'
+        with open(crash_dump, 'a') as f:
+            f.write(f'=== Crash at {time.ctime()} [{context}] ===\n')
+            if exc_info:
+                traceback.print_exception(*exc_info, file=f)
+            f.write('\n')
+        log.critical('Crash dump appended to %s [%s]', crash_dump, context)
+    except Exception as e:
+        log.error('Failed to write crash dump: %s', e)
+
+
 def disk_free(path):
     try:
         st = os.statvfs(path)
@@ -413,6 +426,26 @@ def disk_free(path):
     except Exception as e:
         log.warning('Could not check free space on %s: %s', path, e)
         return 0
+
+
+def _find_vaapi_device():
+    try:
+        cards = sorted(glob.glob('/dev/dri/renderD*'))
+        for card in cards:
+            try:
+                r = subprocess.run(
+                    ['vainfo', '--display', 'drm', '--device', card],
+                    capture_output=True, text=True, timeout=5)
+                if 'Driver version' in r.stdout and 'Supported' in r.stdout:
+                    log.debug('VAAPI device found: %s', card)
+                    return card
+            except Exception:
+                continue
+    except Exception as e:
+        log.warning('VAAPI device detection failed: %s', e)
+    fallback = '/dev/dri/renderD128'
+    log.debug('VAAPI device detection failed, using fallback: %s', fallback)
+    return fallback
 
 
 class SettingsDialog(QDialog):
@@ -700,6 +733,7 @@ class DumpWorker(QThread):
             self.finished.emit(-1, 'Permission denied. Run without sudo.')
         except Exception as e:
             log.error('Dump worker exception: %s', traceback.format_exc())
+            _write_crash_dump('DumpWorker', sys.exc_info())
             self.finished.emit(-1, str(e))
 
     def stop(self):
@@ -750,6 +784,7 @@ class ISOWorker(QThread):
             self.finished.emit(-1, 'Permission denied.')
         except Exception as e:
             log.error('ISO worker exception: %s', traceback.format_exc())
+            _write_crash_dump('ISOWorker', sys.exc_info())
             self.finished.emit(-1, str(e))
 
     def stop(self):
@@ -863,29 +898,69 @@ class CompressWorker(QThread):
             return 0
 
     def _ffmpeg_encode(self, main_movie):
-        cmd = ['ffmpeg', '-i', str(main_movie), '-c:v', 'libx264',
-               '-preset', 'slower', '-profile:v', 'high', '-level', '4.0',
-               '-pix_fmt', 'yuv420p',
-               '-c:a', 'ac3', '-b:a', '448k',
-               '-map', '0:v:0', '-map', '0:a:m:language:eng',
-               '-y', str(self.output_path)]
+        gpu_encoder, gpu_opts = self._detect_gpu_encoder()
+        if gpu_encoder:
+            log.info('Using GPU encoder: %s', gpu_encoder)
+
+        cmd = ['ffmpeg', '-i', str(main_movie)]
+        if gpu_encoder:
+            cmd += gpu_opts
+        else:
+            cmd += ['-c:v', 'libx264', '-preset', 'slower',
+                    '-profile:v', 'high', '-level', '4.0']
+
+        cmd += ['-pix_fmt', 'yuv420p',
+                '-c:a', 'ac3', '-b:a', '448k',
+                '-map', '0:v:0', '-map', '0:a:m:language:eng',
+                '-y', str(self.output_path)]
 
         if self.target_bytes > 0:
             duration = self._get_duration(main_movie)
             if duration > 0:
                 total_kbps = int(self.target_bytes * 8 / duration / 1000)
                 video_kbps = max(100, int((total_kbps - 448) * 0.95))
-                cmd += ['-b:v', f'{video_kbps}k', '-maxrate', f'{int(video_kbps*1.5)}k',
-                        '-bufsize', f'{int(video_kbps*2)}k']
-                log.info('ffmpeg compression target: %d bytes, video bitrate %d kbps',
-                         self.target_bytes, video_kbps)
+                gpu_rate_opts = ['-b:v', f'{video_kbps}k']
+                if gpu_encoder == 'h264_vaapi':
+                    gpu_rate_opts = ['-b:v', f'{video_kbps}k', '-maxrate', f'{int(video_kbps*1.2)}k']
+                cmd += gpu_rate_opts
+                log.info('ffmpeg compression target: %d bytes, video bitrate %d kbps, encoder=%s',
+                         self.target_bytes, video_kbps, gpu_encoder or 'libx264')
             else:
-                cmd += ['-crf', '22']
+                gpu_qual_opts = ['-crf', '22'] if not gpu_encoder else ['-qp', '22']
+                cmd += gpu_qual_opts
         else:
-            cmd += ['-crf', '22']
+            gpu_qual_opts = ['-crf', '22'] if not gpu_encoder else ['-qp', '22']
+            cmd += gpu_qual_opts
 
         log.info('Starting compression (ffmpeg): %s', ' '.join(cmd))
         self._run_subprocess(cmd, 'ffmpeg')
+
+    @staticmethod
+    def _detect_gpu_encoder():
+        try:
+            r = subprocess.run(['ffmpeg', '-encoders'], capture_output=True, text=True, timeout=10)
+            encoders = r.stdout
+        except Exception:
+            return None, []
+
+        # Prefer VAAPI on AMD (radeonsi/Mesa), then AMF, then NVENC, then QSV
+        if 'h264_vaapi' in encoders:
+            vaapi_dev = _find_vaapi_device()
+            log.info('GPU encoder detected: h264_vaapi (device=%s)', vaapi_dev)
+            return 'h264_vaapi', ['-vaapi_device', vaapi_dev,
+                                  '-vf', 'format=nv12,hwupload',
+                                  '-c:v', 'h264_vaapi']
+        if 'h264_amf' in encoders:
+            log.info('GPU encoder detected: h264_amf')
+            return 'h264_amf', ['-c:v', 'h264_amf', '-usage', 'transcoding']
+        if 'h264_nvenc' in encoders:
+            log.info('GPU encoder detected: h264_nvenc')
+            return 'h264_nvenc', ['-c:v', 'h264_nvenc', '-preset', 'p4']
+        if 'h264_qsv' in encoders:
+            log.info('GPU encoder detected: h264_qsv')
+            return 'h264_qsv', ['-c:v', 'h264_qsv']
+        log.info('No GPU encoder found, using CPU (libx264)')
+        return None, []
 
     def _run_subprocess(self, cmd, label):
         try:
@@ -905,6 +980,7 @@ class CompressWorker(QThread):
             self.finished.emit(-1, f'{label} not found in PATH.')
         except Exception as e:
             log.error('%s worker exception: %s', label, traceback.format_exc())
+            _write_crash_dump(f'CompressWorker/{label}', sys.exc_info())
             self.finished.emit(-1, str(e))
 
     def stop(self):
@@ -962,6 +1038,7 @@ class RemuxWorker(QThread):
             self.finished.emit(-1, 'ffmpeg not found. Install ffmpeg.')
         except Exception as e:
             log.error('Remux worker exception: %s', traceback.format_exc())
+            _write_crash_dump('RemuxWorker', sys.exc_info())
             self.finished.emit(-1, str(e))
 
     def stop(self):
@@ -1027,6 +1104,8 @@ class ExtractWorker(QThread):
                 self.finished.emit(-1, 'ffmpeg not found. Install ffmpeg.')
                 return
             except Exception as e:
+                log.error('Extract worker exception: %s', traceback.format_exc())
+                _write_crash_dump('ExtractWorker', sys.exc_info())
                 self.finished.emit(-1, str(e))
                 return
         self.finished.emit(0, '')
@@ -1458,6 +1537,10 @@ class BluRayDumperWindow(QMainWindow):
         self.restore_btn = QPushButton('Restore from ISO')
         self.restore_btn.clicked.connect(self.open_restore)
         feature_row.addWidget(self.restore_btn)
+        self.clear_btn = QPushButton('Clear & Reset')
+        self.clear_btn.setStyleSheet('color: #d9a04a;')
+        self.clear_btn.clicked.connect(self.clear_state)
+        feature_row.addWidget(self.clear_btn)
         feature_row.addStretch()
         self.exit_btn = QPushButton('Exit')
         self.exit_btn.setStyleSheet('color: #d94a4a;')
@@ -2298,6 +2381,28 @@ class BluRayDumperWindow(QMainWindow):
         self.extract_btn.setEnabled(not self._working and self._dump_path is not None)
         self.restore_btn.setEnabled(not self._working)
 
+    def clear_state(self):
+        if self._working:
+            QMessageBox.warning(self, 'Busy', 'Cannot reset while working.')
+            return
+        self.disc_label = None
+        self.disc_size = 0
+        self._dump_path = None
+        self.iso_path = None
+        self._last_sha256 = ''
+        self.status_label.setText('Ready')
+        self.disc_info.setText('No disc data. Insert a disc or select a destination.')
+        self.log_output.setText('')
+        self.dest_label.setText('Destination: not selected')
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(False)
+        self.timer_label.setVisible(False)
+        self.speed_label.setVisible(False)
+        self.dump_btn.setText('Dump This Disc')
+        self.dump_btn.setEnabled(False)
+        self.open_folder_btn.setEnabled(False)
+        log.info('State cleared by user')
+
     def _enter_working_state(self, show_progress=True, show_timer=True,
                               show_speed=True, indeterminate=False,
                               status_text='Working...', log_text='',
@@ -2814,9 +2919,9 @@ class BluRayDumperWindow(QMainWindow):
     def _udf_revision_supported():
         try:
             r = subprocess.run(
-                ['genisoimage', '-udf-revision', '0x0200', '-help'],
+                ['genisoimage', '-udf-revision', '0x0200'],
                 capture_output=True, text=True, timeout=10)
-            return True
+            return r.returncode == 0
         except Exception:
             return False
 
@@ -3174,6 +3279,7 @@ class BluRayDumperWindow(QMainWindow):
 def global_exception_handler(exc_type, exc_value, exc_tb):
     log.critical('Unhandled exception',
                  exc_info=(exc_type, exc_value, exc_tb))
+    _write_crash_dump('main_thread', (exc_type, exc_value, exc_tb))
     try:
         app = QApplication.instance()
         if app:
@@ -3181,17 +3287,54 @@ def global_exception_handler(exc_type, exc_value, exc_tb):
                 None, 'Unexpected Error',
                 f'An unexpected error occurred:\n\n{exc_value}\n\n'
                 'Check the log for details.\n'
-                'The application will continue running.')
+                'A crash dump was saved to ~/bluray_dumper_crash.log')
     except Exception:
         pass
 
 
+def thread_exception_handler(args):
+    log.critical('Unhandled exception in thread: %s',
+                 ''.join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_tb)))
+    _write_crash_dump(f'thread:{args.thread.name if args.thread else "unknown"}',
+                      (args.exc_type, args.exc_value, args.exc_tb))
+
+
+def log_system_info():
+    log.info('=== System Info ===')
+    log.info('Python: %s', sys.version)
+    log.info('Platform: %s', platform.platform())
+    log.info('CPU: %s', platform.processor() or 'unknown')
+    log.info('Memory: %s', platform.machine())
+    for prog, ver_flag in [('ffmpeg', '-version'), ('HandBrakeCLI', '--version'),
+                           ('bluraybackup', '--version'), ('genisoimage', '--version'),
+                           ('blockdev', '--version'), ('eject', '--version')]:
+        try:
+            r = subprocess.run([prog, ver_flag], capture_output=True, text=True, timeout=5)
+            first = (r.stdout or r.stderr or '').split('\n')[0][:120]
+            log.info('%s: %s', prog, first)
+        except Exception:
+            log.info('%s: NOT FOUND', prog)
+    try:
+        st = os.statvfs(str(Path.home()))
+        free_gb = (st.f_frsize * st.f_bavail) / (1024**3)
+        log.info('Free space on home: %.2f GB', free_gb)
+    except Exception:
+        pass
+    log.info('===================')
+
+
 def main():
+    faulthandler.enable()
+    threading.excepthook = thread_exception_handler
     sys.excepthook = global_exception_handler
+
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     app.setQuitOnLastWindowClosed(False)
-    log.info('Blu-ray Dumper starting')
+
+    log.info('=== Blu-ray Dumper starting ===')
+    log_system_info()
+
     win = BluRayDumperWindow()
     win.show()
     win.refresh_profile_list()
