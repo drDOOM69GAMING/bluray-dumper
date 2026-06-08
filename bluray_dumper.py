@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sys, os, struct, subprocess, time, shutil, signal, logging, traceback, hashlib, sqlite3
+import sys, os, struct, subprocess, time, shutil, signal, logging, traceback, hashlib, sqlite3, json, ast
 from pathlib import Path
 from datetime import timedelta
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -787,38 +787,107 @@ class CompressWorker(QThread):
             return
         main_movie = max(m2ts_files, key=lambda f: f.stat().st_size)
 
+        if tool_available('HandBrakeCLI'):
+            cmd = self._build_handbrake_cmd(main_movie)
+            log.info('Starting compression (HandBrakeCLI): %s', ' '.join(cmd))
+            try:
+                self._process = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1)
+                for line in iter(self._process.stdout.readline, ''):
+                    line = line.rstrip('\n\r')
+                    if line:
+                        log.debug('[HandBrakeCLI] %s', line)
+                        self.output_line.emit(line)
+                self._process.stdout.close()
+                self._process.wait()
+                log.info('HandBrakeCLI exited with code %d', self._process.returncode)
+                if self._process.returncode == 0:
+                    try:
+                        out_size = Path(self.output_path).stat().st_size
+                        if out_size >= 10 * 1024 * 1024:
+                            self.finished.emit(0, '')
+                            return
+                        log.warning('HandBrakeCLI returned 0 but output is only %d bytes, treating as failure', out_size)
+                    except OSError:
+                        log.warning('HandBrakeCLI returned 0 but output file missing, treating as failure')
+                else:
+                    log.warning('HandBrakeCLI failed with code %d', self._process.returncode)
+            except FileNotFoundError:
+                log.warning('HandBrakeCLI not found despite tool_available check, falling back to ffmpeg')
+            except Exception as e:
+                log.error('HandBrakeCLI failed: %s', traceback.format_exc())
+                QMessageBox.critical(
+                    None, 'HandBrakeCLI Error',
+                    f'HandBrakeCLI failed:\n{e}\n\nFalling back to ffmpeg.')
+                QApplication.processEvents()
+
+        if tool_available('ffmpeg'):
+            self._ffmpeg_encode(main_movie)
+        else:
+            self.finished.emit(-1, 'Neither HandBrakeCLI nor ffmpeg is available for compression.')
+
+    def _build_handbrake_cmd(self, main_movie):
         cmd = ['HandBrakeCLI', '-i', str(main_movie), '-o', self.output_path,
                '--format', 'av_mkv', '--encoder', 'x264',
+               '--encoder-preset', 'slower',
                '--encoder-profile', 'high', '--encoder-level', '4.0',
                '--cfr',
-               '-x', 'preset=slower',
-               '--subtitle', 'none',
-               '--native-language', 'eng',
                '--aencoder', 'ac3', '--ab', '448k',
-               '--audio-lang-list', 'eng', '--first-audio']
+               '--audio-lang-list', 'eng']
 
         if self.target_bytes > 0:
-            duration = 0
-            try:
-                r = subprocess.run(
-                    ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-                     '-of', 'csv=p=0', str(main_movie)],
-                    capture_output=True, text=True, timeout=30)
-                duration = float(r.stdout.strip())
-            except Exception:
-                pass
+            duration = self._get_duration(main_movie)
             if duration > 0:
                 total_kbps = int(self.target_bytes * 8 / duration / 1000)
                 video_kbps = max(100, int((total_kbps - 448) * 0.95))
                 cmd += ['--vb', str(video_kbps)]
-                log.info('Compression target: %d bytes, video bitrate %d kbps',
+                log.info('HandBrakeCLI compression target: %d bytes, video bitrate %d kbps',
                          self.target_bytes, video_kbps)
             else:
                 log.warning('Could not determine duration, falling back to CRF 22')
                 cmd += ['--quality', '22']
         else:
             cmd += ['--quality', '22']
-        log.info('Starting compression: %s', ' '.join(cmd))
+        return cmd
+
+    def _get_duration(self, main_movie):
+        try:
+            r = subprocess.run(
+                ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                 '-of', 'csv=p=0', str(main_movie)],
+                capture_output=True, text=True, timeout=30)
+            return float(r.stdout.strip())
+        except Exception as e:
+            log.warning('ffprobe duration failed: %s', e)
+            return 0
+
+    def _ffmpeg_encode(self, main_movie):
+        cmd = ['ffmpeg', '-i', str(main_movie), '-c:v', 'libx264',
+               '-preset', 'slower', '-profile:v', 'high', '-level', '4.0',
+               '-pix_fmt', 'yuv420p',
+               '-c:a', 'ac3', '-b:a', '448k',
+               '-map', '0:v:0', '-map', '0:a:m:language:eng',
+               '-y', str(self.output_path)]
+
+        if self.target_bytes > 0:
+            duration = self._get_duration(main_movie)
+            if duration > 0:
+                total_kbps = int(self.target_bytes * 8 / duration / 1000)
+                video_kbps = max(100, int((total_kbps - 448) * 0.95))
+                cmd += ['-b:v', f'{video_kbps}k', '-maxrate', f'{int(video_kbps*1.5)}k',
+                        '-bufsize', f'{int(video_kbps*2)}k']
+                log.info('ffmpeg compression target: %d bytes, video bitrate %d kbps',
+                         self.target_bytes, video_kbps)
+            else:
+                cmd += ['-crf', '22']
+        else:
+            cmd += ['-crf', '22']
+
+        log.info('Starting compression (ffmpeg): %s', ' '.join(cmd))
+        self._run_subprocess(cmd, 'ffmpeg')
+
+    def _run_subprocess(self, cmd, label):
         try:
             self._process = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -826,28 +895,85 @@ class CompressWorker(QThread):
             for line in iter(self._process.stdout.readline, ''):
                 line = line.rstrip('\n\r')
                 if line:
-                    log.debug('[HandBrakeCLI] %s', line)
+                    log.debug('[%s] %s', label, line)
                     self.output_line.emit(line)
             self._process.stdout.close()
             self._process.wait()
-            log.info('HandBrakeCLI exited with code %d', self._process.returncode)
+            log.info('%s exited with code %d', label, self._process.returncode)
             self.finished.emit(self._process.returncode, '')
         except FileNotFoundError:
-            self.finished.emit(-1, 'HandBrakeCLI not found. Install from handbrake.fr')
+            self.finished.emit(-1, f'{label} not found in PATH.')
         except Exception as e:
-            log.error('Compress worker exception: %s', traceback.format_exc())
+            log.error('%s worker exception: %s', label, traceback.format_exc())
             self.finished.emit(-1, str(e))
 
     def stop(self):
         if self._process and self._process.poll() is None:
-            log.warning('Terminating HandBrakeCLI')
+            log.warning('Terminating compression process')
             self._process.terminate()
             try:
                 self._process.wait(3)
             except subprocess.TimeoutExpired:
                 pass
             if self._process.poll() is None:
-                log.warning('Killing HandBrakeCLI')
+                log.warning('Killing compression process')
+                self._process.kill()
+
+
+class RemuxWorker(QThread):
+    finished = pyqtSignal(int, str)
+    output_line = pyqtSignal(str)
+
+    def __init__(self, source_dir, output_path):
+        super().__init__()
+        self.source_dir = source_dir
+        self.output_path = output_path
+        self._process = None
+
+    def run(self):
+        stream_dir = Path(self.source_dir) / 'BDMV' / 'STREAM'
+        if not stream_dir.is_dir():
+            self.finished.emit(-1, 'No BDMV/STREAM directory found')
+            return
+        m2ts_files = list(stream_dir.glob('*.m2ts'))
+        if not m2ts_files:
+            self.finished.emit(-1, 'No M2TS files found')
+            return
+        main_movie = max(m2ts_files, key=lambda f: f.stat().st_size)
+
+        cmd = ['ffmpeg', '-i', str(main_movie),
+               '-map', '0', '-c', 'copy',
+               '-y', str(self.output_path)]
+        log.info('Remuxing main movie: %s', ' '.join(cmd))
+        try:
+            self._process = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1)
+            for line in iter(self._process.stdout.readline, ''):
+                line = line.rstrip('\n\r')
+                if line:
+                    log.debug('[ffmpeg remux] %s', line)
+                    self.output_line.emit(line)
+            self._process.stdout.close()
+            self._process.wait()
+            log.info('ffmpeg remux exited with code %d', self._process.returncode)
+            self.finished.emit(self._process.returncode, '')
+        except FileNotFoundError:
+            self.finished.emit(-1, 'ffmpeg not found. Install ffmpeg.')
+        except Exception as e:
+            log.error('Remux worker exception: %s', traceback.format_exc())
+            self.finished.emit(-1, str(e))
+
+    def stop(self):
+        if self._process and self._process.poll() is None:
+            log.warning('Terminating ffmpeg remux')
+            self._process.terminate()
+            try:
+                self._process.wait(3)
+            except subprocess.TimeoutExpired:
+                pass
+            if self._process.poll() is None:
+                log.warning('Killing ffmpeg remux')
                 self._process.kill()
 
 
@@ -924,7 +1050,6 @@ def list_streams(m2ts_path):
                           capture_output=True, text=True, timeout=30)
         if r.returncode != 0:
             return []
-        import json
         data = json.loads(r.stdout)
         streams = []
         for s in data.get('streams', []):
@@ -1246,6 +1371,7 @@ class BluRayDumperWindow(QMainWindow):
         self.direct_to_mkv = False
         self.extract_worker = None
         self.batch_compress_worker = None
+        self.remux_worker = None
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -1611,7 +1737,6 @@ class BluRayDumperWindow(QMainWindow):
         raw = s.value('batch_queue', '')
         if raw:
             try:
-                import ast
                 restored = ast.literal_eval(raw)
                 if isinstance(restored, list):
                     self.queue = restored
@@ -1884,27 +2009,9 @@ class BluRayDumperWindow(QMainWindow):
                     'bluraybackup reported minor errors but most data was copied.')
                 self._working = False
                 self.reset_buttons()
-                if self.direct_to_mkv and tool_available('HandBrakeCLI'):
-                    compress_target = self.compress_target
-                    compress_bytes = 0
-                    if compress_target == 'custom':
-                        try:
-                            compress_bytes = int(float(self.compress_custom_gb) * 1_000_000_000)
-                        except (ValueError, TypeError):
-                            compress_target = ''
-                    elif compress_target in TARGET_SIZES:
-                        compress_bytes = TARGET_SIZES[compress_target]
-                    if compress_bytes > 0:
-                        label = TARGET_LABELS.get(compress_target, f'{compress_bytes / 1e9:.1f} GB')
-                        reply = QMessageBox.question(
-                            self, 'Compress to MKV?',
-                            f'Direct-to-MKV is enabled.\n\n'
-                            f'Compress main movie to fit {label}?\n'
-                            f'This will skip ISO creation and create an MKV directly.',
-                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-                        if reply == QMessageBox.StandardButton.Yes:
-                            self.start_compress(compress_bytes)
-                            return
+                if self.direct_to_mkv:
+                    if self._handle_direct_mkv():
+                        return
                 msg = (
                     'Disc dump completed with minor warnings.\n\n'
                     f'Dump size: {actual / (1024**3):.2f} GB ({coverage:.0f}% of disc)\n'
@@ -1944,27 +2051,9 @@ class BluRayDumperWindow(QMainWindow):
         self._working = False
         self.reset_buttons()
 
-        if self.direct_to_mkv and tool_available('HandBrakeCLI'):
-            compress_target = self.compress_target
-            compress_bytes = 0
-            if compress_target == 'custom':
-                try:
-                    compress_bytes = int(float(self.compress_custom_gb) * 1_000_000_000)
-                except (ValueError, TypeError):
-                    compress_target = ''
-            elif compress_target in TARGET_SIZES:
-                compress_bytes = TARGET_SIZES[compress_target]
-            if compress_bytes > 0:
-                label = TARGET_LABELS.get(compress_target, f'{compress_bytes / 1e9:.1f} GB')
-                reply = QMessageBox.question(
-                    self, 'Compress to MKV?',
-                    f'Direct-to-MKV is enabled.\n\n'
-                    f'Compress main movie to fit {label}?\n'
-                    f'This will skip ISO creation and create an MKV directly.',
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-                if reply == QMessageBox.StandardButton.Yes:
-                    self.start_compress(compress_bytes)
-                    return
+        if self.direct_to_mkv:
+            if self._handle_direct_mkv():
+                return
 
         msg = ('Disc dump completed successfully.\n\n'
                f'Dump size: {actual / (1024**3):.2f} GB\n\n'
@@ -2246,6 +2335,51 @@ class BluRayDumperWindow(QMainWindow):
 
         QApplication.processEvents()
 
+    def _handle_direct_mkv(self):
+        compress_bytes = self._get_compress_bytes()
+        if compress_bytes > 0:
+            hb_avail = tool_available('HandBrakeCLI')
+            ff_avail = tool_available('ffmpeg')
+            if not hb_avail and not ff_avail:
+                QMessageBox.warning(self, 'No Encoder',
+                    'Compression target is set but neither HandBrakeCLI nor ffmpeg is available.\n'
+                    'Skipping compression.')
+                return False
+            label = TARGET_LABELS.get(self.compress_target,
+                                      f'{compress_bytes / 1e9:.1f} GB')
+            reply = QMessageBox.question(
+                self, 'Compress to MKV?',
+                f'Direct-to-MKV is enabled.\n\n'
+                f'Compress main movie to fit {label}?\n'
+                f'This will skip ISO creation and create an MKV directly.',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.Yes:
+                self.start_compress(compress_bytes)
+                return True
+            return False
+
+        if tool_available('ffmpeg'):
+            reply = QMessageBox.question(
+                self, 'Direct-to-MKV',
+                'Direct-to-MKV is enabled (no compression target).\n\n'
+                'Create MKV from main movie?\n'
+                'Streams will be copied directly (no re-encode).\n'
+                'ISO creation will be skipped.',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.Yes:
+                self.start_remux()
+                return True
+        return False
+
+    def _get_compress_bytes(self):
+        target = self.compress_target
+        if target == 'custom':
+            try:
+                return int(float(self.compress_custom_gb) * 1_000_000_000)
+            except (ValueError, TypeError):
+                return 0
+        return TARGET_SIZES.get(target, 0)
+
     def start_compress(self, target_bytes):
         if self._working:
             log.warning('start_compress called while already working')
@@ -2267,6 +2401,24 @@ class BluRayDumperWindow(QMainWindow):
         self.compress_worker.output_line.connect(self.on_dump_output)
         self.compress_worker.start()
         log.info('Compression started: %s -> %s', self._dump_path, out_path)
+
+    def start_remux(self):
+        if self._working:
+            log.warning('start_remux called while already working')
+            return
+        if not self._dump_path or not self._dump_path.exists():
+            QMessageBox.critical(self, 'Error', 'Dump folder not found.')
+            return
+        out_name = sanitize_filename(self._dump_path.name) + '.mkv'
+        out_path = self._dump_path.parent / out_name
+        self._enter_working_state(indeterminate=True, status_text='Remuxing to MKV...',
+                                  log_text='Remuxing main movie (direct copy, no re-encode)...',
+                                  show_speed=False)
+        self.remux_worker = RemuxWorker(str(self._dump_path), str(out_path))
+        self.remux_worker.finished.connect(self.on_remux_finished)
+        self.remux_worker.output_line.connect(self.on_dump_output)
+        self.remux_worker.start()
+        log.info('Remux started: %s -> %s', self._dump_path, out_path)
 
     def eject_disc(self):
         try:
@@ -2305,6 +2457,10 @@ class BluRayDumperWindow(QMainWindow):
         if self.extract_worker and self.extract_worker.isRunning():
             self.extract_worker.stop()
             self.extract_worker.wait(5000)
+
+        if self.remux_worker and self.remux_worker.isRunning():
+            self.remux_worker.stop()
+            self.remux_worker.wait(5000)
 
         if hasattr(self, '_batch_compress_queue'):
             self._batch_compress_queue = []
@@ -2360,6 +2516,10 @@ class BluRayDumperWindow(QMainWindow):
         if self.extract_worker and self.extract_worker.isRunning():
             self.extract_worker.stop()
             self.extract_worker.wait(5000)
+
+        if self.remux_worker and self.remux_worker.isRunning():
+            self.remux_worker.stop()
+            self.remux_worker.wait(5000)
         event.accept()
 
     def dragEnterEvent(self, event):
@@ -2573,6 +2733,42 @@ class BluRayDumperWindow(QMainWindow):
         else:
             self.queue_next()
 
+    def on_remux_finished(self, retcode, error):
+        if self._cancelled:
+            return
+        log.info('Remux finished with code %d', retcode)
+        self.timer.stop()
+        self._working = False
+        self.reset_buttons()
+        self.progress_bar.setVisible(False)
+        self.timer_label.setVisible(False)
+
+        if retcode != 0:
+            self.status_label.setText('Remux failed')
+            msg = error or f'ffmpeg exited with code {retcode}'
+            self.log_output.setText(f'Remux failed: {msg}')
+            QMessageBox.critical(self, 'Remux Failed',
+                f'MKV remuxing failed.\n{msg}')
+            log.error('Remux failed: %s', msg)
+        else:
+            mkv_path = Path(self.remux_worker.output_path)
+            if not mkv_path.is_file() or mkv_path.stat().st_size < 1024 * 1024:
+                self.status_label.setText('Remux failed')
+                self.log_output.setText('Output MKV is empty or missing.')
+                QMessageBox.critical(self, 'Remux Failed',
+                    'ffmpeg reported success but output is missing or too small.')
+                log.error('Remux produced no valid output at %s', mkv_path)
+            else:
+                self.status_label.setText('Remux complete')
+                self.log_output.setText(f'MKV created: {mkv_path.name}')
+                QMessageBox.information(self, 'Remux Complete',
+                    f'MKV saved as:\n{mkv_path}')
+                log.info('Remux successful: %s (%.2f GB)',
+                         mkv_path, mkv_path.stat().st_size / (1024**3))
+
+        self._finish_after_compress()
+        self.queue_next()
+
     def _offer_dvd_output(self, mkv_path):
         dlg = QDialog(self)
         dlg.setWindowTitle('DVD Output Format')
@@ -2624,6 +2820,21 @@ class BluRayDumperWindow(QMainWindow):
         except Exception:
             return False
 
+    @staticmethod
+    def _run_subprocess_streaming(cmd, timeout=3600, label='process'):
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if result.returncode != 0:
+            log.error('%s failed (code=%d): stdout=%s, stderr=%s',
+                      label, result.returncode,
+                      result.stdout[-500:] if result.stdout else '',
+                      result.stderr[-500:] if result.stderr else '')
+        else:
+            log.debug('%s succeeded (code=0): stdout=%s, stderr=%s',
+                      label,
+                      result.stdout[-200:] if result.stdout else '',
+                      result.stderr[-200:] if result.stderr else '')
+        return result.returncode, result.stdout, result.stderr
+
     def _create_avchd_iso(self, mkv_path):
         self.status_label.setText('Creating AVCHD DVD...')
         self.log_output.setText('Remuxing with ffmpeg...')
@@ -2644,57 +2855,53 @@ class BluRayDumperWindow(QMainWindow):
             shutil.rmtree(avchd_dir)
 
         if self._bluray_muxer_available():
-            try:
-                r = subprocess.run(
-                    ['ffmpeg', '-i', str(mkv_path), '-c:v', 'copy', '-c:a', 'ac3', '-b:a', '448k',
-                     '-f', 'bluray', '-muxrate', '30000000', str(avchd_dir)],
-                    capture_output=True, text=True, timeout=3600)
-                if r.returncode != 0:
-                    raise RuntimeError(f'ffmpeg bluray muxer failed: {r.stderr.strip()[-300:]}')
-            except FileNotFoundError:
-                QMessageBox.critical(self, 'Missing Tool', 'ffmpeg not found.')
-                return
-            except Exception as e:
+            log.info('AVCHD: using ffmpeg bluray muxer')
+            rc, out, err = self._run_subprocess_streaming(
+                ['ffmpeg', '-i', str(mkv_path), '-c:v', 'copy', '-c:a', 'ac3', '-b:a', '448k',
+                 '-f', 'bluray', '-muxrate', '30000000', str(avchd_dir)],
+                label='ffmpeg_bluray')
+            if rc != 0:
+                err_msg = (err[-500:] if err else 'unknown error').strip()
                 self.status_label.setText('AVCHD mux failed')
-                self.log_output.setText(str(e))
-                QMessageBox.critical(self, 'AVCHD Error', f'ffmpeg bluray muxer failed:\n{e}')
+                self.log_output.setText(err_msg)
+                QMessageBox.critical(self, 'AVCHD Error',
+                    f'ffmpeg bluray muxer failed (code {rc}):\n{err_msg}')
                 shutil.rmtree(avchd_dir, ignore_errors=True)
                 return
 
             bdmv = avchd_dir / 'BDMV'
             if not bdmv.is_dir():
                 QMessageBox.critical(self, 'AVCHD Error',
-                                     'ffmpeg did not create the BDMV directory structure.\n'
-                                     'The bluray muxer may not be supported in this ffmpeg build.')
+                    'ffmpeg did not create the BDMV directory structure.\n'
+                    'The bluray muxer may not be supported in this ffmpeg build.\n\n'
+                    f'Check the log for details from ffmpeg bluray muxer.')
                 shutil.rmtree(avchd_dir, ignore_errors=True)
                 return
         else:
+            log.info('AVCHD: bluray muxer not available, using fallback remux')
             self.log_output.setText('ffmpeg bluray muxer not available, using fallback...')
             QApplication.processEvents()
             m2ts_path = avchd_dir / 'temp.m2ts'
             avchd_dir.mkdir(parents=True, exist_ok=True)
-            try:
-                r = subprocess.run(
-                    ['ffmpeg', '-i', str(mkv_path), '-c:v', 'copy', '-c:a', 'ac3', '-b:a', '448k',
-                     '-f', 'mpegts', '-mpegts_m2ts_mode', '1', '-y', str(m2ts_path)],
-                    capture_output=True, text=True, timeout=3600)
-                if r.returncode != 0:
-                    raise RuntimeError(f'ffmpeg remux failed: {r.stderr.strip()[-200:]}')
-            except FileNotFoundError:
-                QMessageBox.critical(self, 'Missing Tool', 'ffmpeg not found.')
-                shutil.rmtree(avchd_dir, ignore_errors=True)
-                return
-            except Exception as e:
+
+            rc, out, err = self._run_subprocess_streaming(
+                ['ffmpeg', '-i', str(mkv_path), '-c:v', 'copy', '-c:a', 'ac3', '-b:a', '448k',
+                 '-f', 'mpegts', '-mpegts_m2ts_mode', '1', '-y', str(m2ts_path)],
+                label='ffmpeg_m2ts')
+            if rc != 0:
+                err_msg = (err[-500:] if err else 'unknown error').strip()
                 self.status_label.setText('AVCHD remux failed')
-                self.log_output.setText(str(e))
-                QMessageBox.critical(self, 'AVCHD Error', f'Remuxing failed:\n{e}')
+                self.log_output.setText(err_msg)
+                QMessageBox.critical(self, 'AVCHD Error',
+                    f'ffmpeg remux to M2TS failed (code {rc}):\n{err_msg}')
                 shutil.rmtree(avchd_dir, ignore_errors=True)
                 return
 
             if m2ts_path.stat().st_size < 10 * 1024 * 1024:
                 QMessageBox.critical(self, 'AVCHD Error',
-                                     f'M2TS is only {m2ts_path.stat().st_size / (1024*1024):.1f} MB.\n'
-                                     'The video stream may be corrupt.')
+                    f'M2TS is only {m2ts_path.stat().st_size / (1024*1024):.1f} MB.\n'
+                    'The video stream may be corrupt.\n'
+                    f'Check {LOG_FILE} for ffprobe/ffmpeg output during remux.')
                 shutil.rmtree(avchd_dir, ignore_errors=True)
                 return
 
@@ -2704,8 +2911,12 @@ class BluRayDumperWindow(QMainWindow):
                 create_avchd_structure(m2ts_path, avchd_dir)
             except Exception as e:
                 self.status_label.setText('AVCHD structure failed')
+                err_msg = traceback.format_exc()
+                log.error('AVCHD structure creation failed:\n%s', err_msg)
                 self.log_output.setText(str(e))
-                QMessageBox.critical(self, 'AVCHD Error', f'Structure creation failed:\n{e}')
+                QMessageBox.critical(self, 'AVCHD Error',
+                    f'AVCHD structure creation failed:\n{e}\n\n'
+                    f'Check {LOG_FILE} for details.')
                 shutil.rmtree(avchd_dir, ignore_errors=True)
                 return
             finally:
@@ -2721,23 +2932,20 @@ class BluRayDumperWindow(QMainWindow):
         vol_id = name_stem.replace('_', ' ')[:32].upper().strip() or 'AVCHD'
         self.log_output.setText('Creating AVCHD ISO...')
         QApplication.processEvents()
-        try:
-            cmd = ['genisoimage', '-iso-level', '4', '-udf']
-            if self._udf_revision_supported():
-                cmd += ['-udf-revision', '0x0200']
-            cmd += ['-V', vol_id, '-volset', vol_id,
+
+        iso_cmd = ['genisoimage', '-iso-level', '4', '-udf']
+        if self._udf_revision_supported():
+            iso_cmd += ['-udf-revision', '0x0200']
+        iso_cmd += ['-V', vol_id, '-volset', vol_id,
                     '-o', str(iso_path), str(avchd_dir)]
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-            if r.returncode != 0:
-                raise RuntimeError(f'ISO creation failed: {r.stderr.strip()[-200:]}')
-        except FileNotFoundError:
-            QMessageBox.critical(self, 'Missing Tool', 'genisoimage not found.')
-            shutil.rmtree(avchd_dir, ignore_errors=True)
-            return
-        except Exception as e:
+
+        rc, out, err = self._run_subprocess_streaming(iso_cmd, label='genisoimage_avchd')
+        if rc != 0:
+            err_msg = (err[-500:] if err else 'unknown error').strip()
             self.status_label.setText('AVCHD ISO failed')
-            self.log_output.setText(str(e))
-            QMessageBox.critical(self, 'AVCHD Error', f'ISO creation failed:\n{e}')
+            self.log_output.setText(err_msg)
+            QMessageBox.critical(self, 'AVCHD Error',
+                f'ISO creation failed (code {rc}):\n{err_msg}')
             shutil.rmtree(avchd_dir, ignore_errors=True)
             return
 
@@ -2776,27 +2984,22 @@ class BluRayDumperWindow(QMainWindow):
         dvd_dir.mkdir(parents=True, exist_ok=True)
 
         mpg_path = dvd_dir / 'temp.mpg'
-        try:
-            scaled = self._detect_dvd_format(mkv_path)
-            w, h = ('720', '480') if scaled == 'ntsc' else ('720', '576')
-            r = subprocess.run(
-                ['ffmpeg', '-i', str(mkv_path), '-c:v', 'mpeg2video',
-                 '-vf', f'scale={w}:{h}:force_original_aspect_ratio=decrease,'
-                       f'pad={w}:{h}:(ow-iw)/2:(oh-ih)/2',
-                 '-b:v', '8M', '-maxrate', '9M', '-bufsize', '2M',
-                 '-c:a', 'ac3', '-ac', '2', '-b:a', '448k',
-                 '-f', 'dvd', '-y', str(mpg_path)],
-                capture_output=True, text=True, timeout=3600)
-            if r.returncode != 0:
-                raise RuntimeError(f'ffmpeg DVD encode failed: {r.stderr.strip()[-200:]}')
-        except FileNotFoundError:
-            QMessageBox.critical(self, 'Missing Tool', 'ffmpeg not found.')
-            shutil.rmtree(dvd_dir, ignore_errors=True)
-            return
-        except Exception as e:
+        scaled = self._detect_dvd_format(mkv_path)
+        w, h = ('720', '480') if scaled == 'ntsc' else ('720', '576')
+        rc, out, err = self._run_subprocess_streaming(
+            ['ffmpeg', '-i', str(mkv_path), '-c:v', 'mpeg2video',
+             '-vf', f'scale={w}:{h}:force_original_aspect_ratio=decrease,'
+                   f'pad={w}:{h}:(ow-iw)/2:(oh-ih)/2',
+             '-b:v', '8M', '-maxrate', '9M', '-bufsize', '2M',
+             '-c:a', 'ac3', '-ac', '2', '-b:a', '448k',
+             '-f', 'dvd', '-y', str(mpg_path)],
+            label='ffmpeg_dvd')
+        if rc != 0:
+            err_msg = (err[-500:] if err else 'unknown error').strip()
             self.status_label.setText('DVD encode failed')
-            self.log_output.setText(str(e))
-            QMessageBox.critical(self, 'DVD Error', f'MPEG-2 encoding failed:\n{e}')
+            self.log_output.setText(err_msg)
+            QMessageBox.critical(self, 'DVD Error',
+                f'MPEG-2 encoding failed (code {rc}):\n{err_msg}')
             shutil.rmtree(dvd_dir, ignore_errors=True)
             return
 
@@ -2807,11 +3010,11 @@ class BluRayDumperWindow(QMainWindow):
             fmt = self._detect_dvd_format(mpg_path)
             dvd_size = '720x480' if fmt == 'ntsc' else '720x576'
             vmgm_mpg = dvd_dir / 'vmgm.mpg'
-            r = subprocess.run(
+            rc2, _, _ = self._run_subprocess_streaming(
                 ['ffmpeg', '-f', 'lavfi', '-i', 'color=c=black:s=' + dvd_size + ':d=0.04',
                  '-c:v', 'mpeg2video', '-frames:v', '1',
                  '-b:v', '1M', '-y', str(vmgm_mpg)],
-                capture_output=True, text=True, timeout=120)
+                timeout=120, label='ffmpeg_vmgm')
             xml = (
                 '<?xml version="1.0" encoding="UTF-8"?>\n'
                 f'<dvdauthor dest="{dvd_dir}">\n'
@@ -2833,23 +3036,22 @@ class BluRayDumperWindow(QMainWindow):
             )
             xml_path = dvd_dir / 'dvd.xml'
             xml_path.write_text(xml)
-            try:
-                r = subprocess.run(
-                    ['dvdauthor', '-x', str(xml_path)],
-                    capture_output=True, text=True, timeout=300)
-                if r.returncode != 0:
-                    raise RuntimeError(f'dvdauthor failed: {r.stderr.strip()[-400:]}')
-            except Exception as e:
+            rc3, out3, err3 = self._run_subprocess_streaming(
+                ['dvdauthor', '-x', str(xml_path)],
+                timeout=300, label='dvdauthor')
+            if rc3 != 0:
+                err_msg = (err3[-500:] if err3 else 'unknown error').strip()
                 self.status_label.setText('DVD authoring failed')
-                self.log_output.setText(str(e))
-                QMessageBox.critical(self, 'DVD Error', f'dvdauthor failed:\n{e}')
+                self.log_output.setText(err_msg)
+                QMessageBox.critical(self, 'DVD Error',
+                    f'dvdauthor failed (code {rc3}):\n{err_msg}\n\n'
+                    f'Check {LOG_FILE} for full output.')
                 shutil.rmtree(dvd_dir, ignore_errors=True)
                 return
-            finally:
-                if mpg_path.exists():
-                    mpg_path.unlink()
-                if vmgm_mpg.exists():
-                    vmgm_mpg.unlink()
+            if mpg_path.exists():
+                mpg_path.unlink()
+            if vmgm_mpg.exists():
+                vmgm_mpg.unlink()
             iso_cmd = ['genisoimage', '-dvd-video', '-o']
         else:
             self.log_output.setText('dvdauthor not found — creating VOB fallback...')
@@ -2864,20 +3066,15 @@ class BluRayDumperWindow(QMainWindow):
         iso_path = dvd_dir.parent / f'{name_stem}_dvd.iso'
         self.log_output.setText('Creating DVD ISO...')
         QApplication.processEvents()
-        try:
-            r = subprocess.run(
-                iso_cmd + [str(iso_path), str(dvd_dir)],
-                capture_output=True, text=True, timeout=3600)
-            if r.returncode != 0:
-                raise RuntimeError(f'ISO creation failed: {r.stderr.strip()[-200:]}')
-        except FileNotFoundError:
-            QMessageBox.critical(self, 'Missing Tool', 'genisoimage not found.')
-            shutil.rmtree(dvd_dir, ignore_errors=True)
-            return
-        except Exception as e:
+        rc4, out4, err4 = self._run_subprocess_streaming(
+            iso_cmd + [str(iso_path), str(dvd_dir)],
+            timeout=3600, label='genisoimage_dvd')
+        if rc4 != 0:
+            err_msg = (err4[-500:] if err4 else 'unknown error').strip()
             self.status_label.setText('DVD ISO failed')
-            self.log_output.setText(str(e))
-            QMessageBox.critical(self, 'DVD Error', f'ISO creation failed:\n{e}')
+            self.log_output.setText(err_msg)
+            QMessageBox.critical(self, 'DVD Error',
+                f'ISO creation failed (code {rc4}):\n{err_msg}')
             shutil.rmtree(dvd_dir, ignore_errors=True)
             return
 
