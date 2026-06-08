@@ -1,3 +1,5 @@
+<img width="1224" height="1238" alt="Screenshot_20260608_033316" src="https://github.com/user-attachments/assets/6df5e5e0-0838-4ba4-96ff-74e4b99eab6c" />
+
 # bluray-dumper
 
 PyQt6 GUI for dumping Blu-ray discs, creating UDF ISOs, and compressing to MKV/AVCHD/DVD-Video.
