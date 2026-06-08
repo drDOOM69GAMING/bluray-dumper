@@ -810,7 +810,7 @@ class CompressWorker(QThread):
             if duration > 0:
                 total_kbps = int(self.target_bytes * 8 / duration / 1000)
                 video_kbps = max(100, int((total_kbps - 448) * 0.95))
-                cmd += ['--vb', str(video_kbps), '--two-pass']
+                cmd += ['--vb', str(video_kbps)]
                 log.info('Compression target: %d bytes, video bitrate %d kbps',
                          self.target_bytes, video_kbps)
             else:
@@ -2614,6 +2614,16 @@ class BluRayDumperWindow(QMainWindow):
         except Exception:
             return False
 
+    @staticmethod
+    def _udf_revision_supported():
+        try:
+            r = subprocess.run(
+                ['genisoimage', '-udf-revision', '0x0200', '-help'],
+                capture_output=True, text=True, timeout=10)
+            return True
+        except Exception:
+            return False
+
     def _create_avchd_iso(self, mkv_path):
         self.status_label.setText('Creating AVCHD DVD...')
         self.log_output.setText('Remuxing with ffmpeg...')
@@ -2712,11 +2722,12 @@ class BluRayDumperWindow(QMainWindow):
         self.log_output.setText('Creating AVCHD ISO...')
         QApplication.processEvents()
         try:
-            r = subprocess.run(
-                ['genisoimage', '-udf', '-udf-revision', '0x0200',
-                 '-V', vol_id, '-volset', vol_id,
-                 '-o', str(iso_path), str(avchd_dir)],
-                capture_output=True, text=True, timeout=3600)
+            cmd = ['genisoimage', '-udf']
+            if self._udf_revision_supported():
+                cmd += ['-udf-revision', '0x0200']
+            cmd += ['-V', vol_id, '-volset', vol_id,
+                    '-o', str(iso_path), str(avchd_dir)]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
             if r.returncode != 0:
                 raise RuntimeError(f'ISO creation failed: {r.stderr.strip()[-200:]}')
         except FileNotFoundError:
