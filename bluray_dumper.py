@@ -456,6 +456,11 @@ class SettingsDialog(QDialog):
         compress_layout.addWidget(note)
         layout.addWidget(compress_group)
 
+        credit = QLabel('Copyright drdoom69gaming')
+        credit.setStyleSheet('color: #888; font-size: 10px;')
+        credit.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(credit)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.save_settings)
