@@ -233,6 +233,14 @@ def create_avchd_structure(m2ts_path, output_dir):
     (bdmv / 'CLIPINF').mkdir(parents=True, exist_ok=True)
     (bdmv / 'STREAM').mkdir(parents=True, exist_ok=True)
 
+    cert_dir = output_dir / 'CERTIFICATE'
+    cert_dir.mkdir(parents=True, exist_ok=True)
+    id_data = bytearray(6144)
+    id_data[0:12] = b'CERTIFICATE\x00\x00\x00'
+    id_bytes = bytes(id_data)
+    (cert_dir / 'id.bdmv').write_bytes(id_bytes)
+    log.debug('Wrote CERTIFICATE/id.bdmv (%d bytes)', len(id_bytes))
+
     stream_file = bdmv / 'STREAM' / '00000.m2ts'
     shutil.copy2(m2ts_path, stream_file)
     file_size = stream_file.stat().st_size
@@ -303,8 +311,30 @@ def _write_movieobject_bdmv(path):
     log.debug('Wrote MovieObject.bdmv (%d bytes)', len(data))
 
 
-def _write_playlist(path, duration_sec):
+def _write_playlist(path, duration_sec, has_audio=True):
     total_ticks = int(duration_sec * 45000)
+    stn_length = 0
+    stn_buf = bytearray()
+    stn_buf += struct.pack('>H', 1 if has_audio else 0)
+    stn_buf += b'\x00' * 2
+    stn_buf += struct.pack('>B', 1)
+    stn_buf += struct.pack('>B', 0x1B)
+    stn_buf += b'\x00' * 4
+    stn_buf += struct.pack('>I', 0)
+    stn_buf += struct.pack('>I', 0xFFFFFFFF)
+    if has_audio:
+        stn_buf += struct.pack('>B', 1)
+        stn_buf += struct.pack('>B', 0x80)
+        stn_buf += b'\x00' * 4
+    stn_buf += struct.pack('>B', 0x80 if has_audio else 0)
+    stn_buf += struct.pack('>B', 0x00)
+    stn_buf += b'\x00' * 3
+    stn_buf += struct.pack('>B', 1)
+    stn_buf += b'\x00' * 3
+    stn_buf += struct.pack('>B', 1)
+    stn_buf += b'\x00' * 3
+    stn_length = len(stn_buf)
+
     data = bytearray()
     data += b'MPLS'
     data += struct.pack('>HH', 0x0100, 0x2400)
@@ -314,29 +344,24 @@ def _write_playlist(path, duration_sec):
         data += b'\x00'
     data += struct.pack('>H', 1)
     data += struct.pack('>H', 0)
-    data += struct.pack('>B', 0)
+    data += struct.pack('>B', 1)
     data += b'\x00' * 3
     data += struct.pack('>II', 0, total_ticks)
-    data += struct.pack('>II', 0, total_ticks)
+    data += struct.pack('>II', 0, 0)
     data += struct.pack('>H', 1)
     data += struct.pack('>H', 0xFFFF)
     data += b'00000'
-    data += struct.pack('>B', 1)
+    data += struct.pack('>B', 0x60)
     data += struct.pack('>B', 0)
-    data += struct.pack('>H', 0)
-    data += struct.pack('>H', 1)
-    data += struct.pack('>H', 0)
-    data += struct.pack('>H', 0)
-    data += struct.pack('>I', 0)
-    data += struct.pack('>II', 0, total_ticks)
-    data += struct.pack('>II', 0, total_ticks)
-    data += struct.pack('>H', 0)
-    data += struct.pack('>H', 0xFFFF)
+    data += b'\x00' * 2
+    data += b'\x00' * 2
+    data += struct.pack('>H', stn_length)
+    data += stn_buf
     path.write_bytes(bytes(data))
     log.debug('Wrote playlist (%d bytes, %.1f sec)', len(data), duration_sec)
 
 
-def _write_clipinfo(path, file_size, duration_sec):
+def _write_clipinfo(path, file_size, duration_sec, has_audio=True):
     total_ticks = int(duration_sec * 45000)
     data = bytearray()
     data += b'CLPI'
@@ -354,18 +379,24 @@ def _write_clipinfo(path, file_size, duration_sec):
     data += struct.pack('>II', 0, total_ticks)
     data += struct.pack('>II', 0, total_ticks)
     data += struct.pack('>II', 0, total_ticks)
-    data += struct.pack('>II', 0, 0)
+    data += struct.pack('>II', 0, 1)
     data += struct.pack('>H', 1)
-    data += struct.pack('>H', 0)
+    data += struct.pack('>H', 1 if has_audio else 0)
     data += struct.pack('>B', 1)
     data += struct.pack('>B', 0x1B)
-    data += b'\x00' * 4
+    data += struct.pack('>H', 0x1011)
+    data += struct.pack('>H', 0)
     data += struct.pack('>I', 0)
     data += struct.pack('>I', 0xFFFFFFFF)
-    data += struct.pack('>H', 0)
-    data += struct.pack('>H', 1)
-    data += struct.pack('>B', 128)
-    data += struct.pack('>B', 0)
+    if has_audio:
+        data += struct.pack('>B', 1)
+        data += struct.pack('>B', 0x80)
+        data += struct.pack('>H', 0x1100)
+        data += struct.pack('>H', 0)
+        data += struct.pack('>B', 0x80)
+        data += struct.pack('>B', 0x00)
+        data += struct.pack('>B', 0x00)
+        data += struct.pack('>B', 0x00)
     path.write_bytes(bytes(data))
     log.debug('Wrote clipinfo (%d bytes, size=%d)', len(data), file_size)
 
@@ -733,10 +764,11 @@ class CompressWorker(QThread):
     finished = pyqtSignal(int, str)
     output_line = pyqtSignal(str)
 
-    def __init__(self, source_dir, output_path):
+    def __init__(self, source_dir, output_path, target_bytes=0):
         super().__init__()
         self.source_dir = source_dir
         self.output_path = output_path
+        self.target_bytes = target_bytes
         self._process = None
 
     def run(self):
@@ -752,10 +784,20 @@ class CompressWorker(QThread):
 
         cmd = ['HandBrakeCLI', '-i', str(main_movie), '-o', self.output_path,
                '--format', 'av_mkv', '--encoder', 'x264',
-               '--quality', '22', '--cfr',
+               '--encoder-profile', 'high', '--encoder-level', '4.0',
+               '--cfr',
                '-x', 'preset=slower',
                '--subtitle', 'none',
-               '--native-language', 'eng']
+               '--native-language', 'eng',
+               '--aencoder', 'ac3', '--ab', '448k',
+               '--audio-lang-list', 'eng', '--first-audio']
+
+        if self.target_bytes > 0:
+            target_mb = max(1, int(self.target_bytes * 0.92 / (1024 * 1024)))
+            cmd += ['--size', str(target_mb)]
+            log.info('Compression targeting %d MB (%d bytes)', target_mb, self.target_bytes)
+        else:
+            cmd += ['--quality', '22']
         log.info('Starting compression: %s', ' '.join(cmd))
         try:
             self._process = subprocess.Popen(
@@ -2200,7 +2242,7 @@ class BluRayDumperWindow(QMainWindow):
                                   show_speed=False)
 
         self.compress_worker = CompressWorker(
-            str(self._dump_path), str(out_path))
+            str(self._dump_path), str(out_path), target_bytes)
         self.compress_worker.finished.connect(self.on_compress_finished)
         self.compress_worker.output_line.connect(self.on_dump_output)
         self.compress_worker.start()
@@ -2531,54 +2573,116 @@ class BluRayDumperWindow(QMainWindow):
                 self, 'Compression Done',
                 f'Compressed MKV saved as:\n{mkv_path}')
 
+    @staticmethod
+    def _bluray_muxer_available():
+        try:
+            r = subprocess.run(['ffmpeg', '-muxers'], capture_output=True, text=True, timeout=10)
+            return 'bluray' in r.stdout
+        except Exception:
+            return False
+
     def _create_avchd_iso(self, mkv_path):
         self.status_label.setText('Creating AVCHD DVD...')
-        self.log_output.setText('Remuxing to M2TS...')
+        self.log_output.setText('Remuxing with ffmpeg...')
         QApplication.processEvents()
+
+        mkv_size = Path(mkv_path).stat().st_size
+        if mkv_size < 10 * 1024 * 1024:
+            QMessageBox.critical(self, 'AVCHD Error',
+                                 f'Compressed MKV is only {mkv_size / (1024*1024):.1f} MB.\n'
+                                 'Something went wrong during compression.')
+            return
 
         name_stem = Path(mkv_path).stem.replace('_compressed', '')
         avchd_dir = Path(mkv_path).parent / f'avchd_{name_stem}'
-        m2ts_path = avchd_dir / 'temp.m2ts'
-        avchd_dir.mkdir(parents=True, exist_ok=True)
-
-        try:
-            r = subprocess.run(
-                ['ffmpeg', '-i', str(mkv_path), '-c', 'copy',
-                 '-f', 'mpegts', '-y', str(m2ts_path)],
-                capture_output=True, text=True, timeout=3600)
-            if r.returncode != 0:
-                raise RuntimeError(f'ffmpeg remux failed: {r.stderr.strip()[-200:]}')
-        except FileNotFoundError:
-            QMessageBox.critical(self, 'Missing Tool', 'ffmpeg not found.')
-            shutil.rmtree(avchd_dir, ignore_errors=True)
-            return
-        except Exception as e:
-            self.status_label.setText('AVCHD remux failed')
-            self.log_output.setText(str(e))
-            QMessageBox.critical(self, 'AVCHD Error', f'Remuxing failed:\n{e}')
-            shutil.rmtree(avchd_dir, ignore_errors=True)
-            return
-
-        self.log_output.setText('Building AVCHD structure...')
-        QApplication.processEvents()
-        try:
-            create_avchd_structure(m2ts_path, avchd_dir)
-        except Exception as e:
-            self.status_label.setText('AVCHD structure failed')
-            self.log_output.setText(str(e))
-            QMessageBox.critical(self, 'AVCHD Error', f'Structure creation failed:\n{e}')
-            shutil.rmtree(avchd_dir, ignore_errors=True)
-            return
-        finally:
-            if m2ts_path.exists():
-                m2ts_path.unlink()
-
         iso_path = avchd_dir.parent / f'{name_stem}_avchd.iso'
+
+        if avchd_dir.exists():
+            shutil.rmtree(avchd_dir)
+
+        if self._bluray_muxer_available():
+            try:
+                r = subprocess.run(
+                    ['ffmpeg', '-i', str(mkv_path), '-c:v', 'copy', '-c:a', 'ac3', '-b:a', '448k',
+                     '-f', 'bluray', '-muxrate', '30000000', str(avchd_dir)],
+                    capture_output=True, text=True, timeout=3600)
+                if r.returncode != 0:
+                    raise RuntimeError(f'ffmpeg bluray muxer failed: {r.stderr.strip()[-300:]}')
+            except FileNotFoundError:
+                QMessageBox.critical(self, 'Missing Tool', 'ffmpeg not found.')
+                return
+            except Exception as e:
+                self.status_label.setText('AVCHD mux failed')
+                self.log_output.setText(str(e))
+                QMessageBox.critical(self, 'AVCHD Error', f'ffmpeg bluray muxer failed:\n{e}')
+                shutil.rmtree(avchd_dir, ignore_errors=True)
+                return
+
+            bdmv = avchd_dir / 'BDMV'
+            if not bdmv.is_dir():
+                QMessageBox.critical(self, 'AVCHD Error',
+                                     'ffmpeg did not create the BDMV directory structure.\n'
+                                     'The bluray muxer may not be supported in this ffmpeg build.')
+                shutil.rmtree(avchd_dir, ignore_errors=True)
+                return
+        else:
+            self.log_output.setText('ffmpeg bluray muxer not available, using fallback...')
+            QApplication.processEvents()
+            m2ts_path = avchd_dir / 'temp.m2ts'
+            avchd_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                r = subprocess.run(
+                    ['ffmpeg', '-i', str(mkv_path), '-c:v', 'copy', '-c:a', 'ac3', '-b:a', '448k',
+                     '-f', 'mpegts', '-mpegts_m2ts_mode', '1', '-y', str(m2ts_path)],
+                    capture_output=True, text=True, timeout=3600)
+                if r.returncode != 0:
+                    raise RuntimeError(f'ffmpeg remux failed: {r.stderr.strip()[-200:]}')
+            except FileNotFoundError:
+                QMessageBox.critical(self, 'Missing Tool', 'ffmpeg not found.')
+                shutil.rmtree(avchd_dir, ignore_errors=True)
+                return
+            except Exception as e:
+                self.status_label.setText('AVCHD remux failed')
+                self.log_output.setText(str(e))
+                QMessageBox.critical(self, 'AVCHD Error', f'Remuxing failed:\n{e}')
+                shutil.rmtree(avchd_dir, ignore_errors=True)
+                return
+
+            if m2ts_path.stat().st_size < 10 * 1024 * 1024:
+                QMessageBox.critical(self, 'AVCHD Error',
+                                     f'M2TS is only {m2ts_path.stat().st_size / (1024*1024):.1f} MB.\n'
+                                     'The video stream may be corrupt.')
+                shutil.rmtree(avchd_dir, ignore_errors=True)
+                return
+
+            self.log_output.setText('Building AVCHD structure (fallback)...')
+            QApplication.processEvents()
+            try:
+                create_avchd_structure(m2ts_path, avchd_dir)
+            except Exception as e:
+                self.status_label.setText('AVCHD structure failed')
+                self.log_output.setText(str(e))
+                QMessageBox.critical(self, 'AVCHD Error', f'Structure creation failed:\n{e}')
+                shutil.rmtree(avchd_dir, ignore_errors=True)
+                return
+            finally:
+                if m2ts_path.exists():
+                    m2ts_path.unlink()
+
+        cert_dir = avchd_dir / 'CERTIFICATE'
+        cert_dir.mkdir(parents=True, exist_ok=True)
+        id_data = bytearray(6144)
+        id_data[0:12] = b'CERTIFICATE\x00\x00\x00'
+        (cert_dir / 'id.bdmv').write_bytes(bytes(id_data))
+
+        vol_id = name_stem.replace('_', ' ')[:32].upper().strip() or 'AVCHD'
         self.log_output.setText('Creating AVCHD ISO...')
         QApplication.processEvents()
         try:
             r = subprocess.run(
-                ['genisoimage', '-udf', '-o', str(iso_path), str(avchd_dir)],
+                ['genisoimage', '-udf', '-udf-revision', '0x0200',
+                 '-V', vol_id, '-volset', vol_id,
+                 '-o', str(iso_path), str(avchd_dir)],
                 capture_output=True, text=True, timeout=3600)
             if r.returncode != 0:
                 raise RuntimeError(f'ISO creation failed: {r.stderr.strip()[-200:]}')
