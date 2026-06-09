@@ -145,7 +145,7 @@ def install_missing_tools(tools, parent=None, pm=None):
             f'Install packages with {pm}?\n\n'
             f'  sudo {pm} {" ".join(pm_install)} {" ".join(pkgs)}')
         btn_install = msg.addButton('Install', QMessageBox.ButtonRole.ActionRole)
-        msg.addButton('Skip', QMessageBox.RejectRole)
+        msg.addButton('Skip', QMessageBox.ButtonRole.RejectRole)
         msg.exec()
         if msg.clickedButton() != btn_install:
             return False
@@ -177,7 +177,7 @@ def ensure_tool(name, parent=None, pm=None):
         msg.setIcon(QMessageBox.Icon.Question)
         msg.setText(f'{name} is required for this operation.')
         btn_install = msg.addButton('Install', QMessageBox.ButtonRole.ActionRole)
-        msg.addButton('Cancel', QMessageBox.RejectRole)
+        msg.addButton('Cancel', QMessageBox.ButtonRole.RejectRole)
         msg.exec()
         if msg.clickedButton() == btn_install:
             if install_missing_tools([name], parent=parent, pm=pm):
@@ -959,6 +959,7 @@ class CompressWorker(QThread):
             log.info('GPU encoder detected (%s), using ffmpeg with hardware acceleration', gpu_encoder)
             self.encoder_name = f'ffmpeg {gpu_encoder}'
             self._ffmpeg_encode(main_movie)
+            return
         elif tool_available('HandBrakeCLI'):
             self.encoder_name = 'HandBrakeCLI'
             cmd = self._build_handbrake_cmd(main_movie)
@@ -2043,7 +2044,7 @@ class BluRayDumperWindow(QMainWindow):
                     'Install automatically?')
                 btn_install = msg.addButton('Install', QMessageBox.ButtonRole.ActionRole)
                 btn_manual = msg.addButton('Show Instructions', QMessageBox.ButtonRole.ActionRole)
-                msg.addButton('Skip', QMessageBox.RejectRole)
+                msg.addButton('Skip', QMessageBox.ButtonRole.RejectRole)
                 msg.exec()
 
                 if msg.clickedButton() == btn_install:
@@ -3400,50 +3401,33 @@ class BluRayDumperWindow(QMainWindow):
 
     @staticmethod
     def _run_subprocess_streaming(cmd, timeout=3600, label='process'):
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, bufsize=1)
-        out_lines = []
-        err_lines = []
-
-        def _reader(pipe, store):
+        result = [None]
+        exc = [None]
+        def _run():
             try:
-                for line in iter(pipe.readline, ''):
-                    store.append(line)
-            except ValueError:
-                pass
-            finally:
-                pipe.close()
-
-        out_t = threading.Thread(target=_reader, args=(proc.stdout, out_lines), daemon=True)
-        err_t = threading.Thread(target=_reader, args=(proc.stderr, err_lines), daemon=True)
-        out_t.start()
-        err_t.start()
-
-        elapsed = 0.0
-        poll = 0.05
-        while proc.poll() is None:
-            time.sleep(poll)
-            elapsed += poll
+                result[0] = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=timeout)
+            except Exception as e:
+                exc[0] = e
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        while thread.is_alive():
+            thread.join(0.05)
             QApplication.processEvents()
-            if timeout and elapsed > timeout:
-                proc.kill()
-                proc.wait(2)
-                out_t.join(1)
-                err_t.join(1)
-                raise subprocess.TimeoutExpired(cmd, timeout)
-
-        out_t.join(2)
-        err_t.join(2)
-        out = ''.join(out_lines)
-        err = ''.join(err_lines)
-        rc = proc.returncode
-        if rc != 0:
+        if exc[0] is not None:
+            raise exc[0]
+        r = result[0]
+        if r.returncode != 0:
             log.error('%s failed (code=%d): stdout=%s, stderr=%s',
-                      label, rc, out[-500:] if out else '', err[-500:] if err else '')
+                      label, r.returncode,
+                      r.stdout[-500:] if r.stdout else '',
+                      r.stderr[-500:] if r.stderr else '')
         else:
             log.debug('%s succeeded (code=0): stdout=%s, stderr=%s',
-                      label, out[-200:] if out else '', err[-200:] if err else '')
-        return rc, out, err
+                      label,
+                      r.stdout[-200:] if r.stdout else '',
+                      r.stderr[-200:] if r.stderr else '')
+        return r.returncode, r.stdout, r.stderr
 
     def _create_avchd_iso(self, mkv_path):
         self._disc_widget.set_mode('writing')
@@ -3730,7 +3714,7 @@ class BluRayDumperWindow(QMainWindow):
         msg.setInformativeText('How would you like to burn this disc?')
         btn_k3b = msg.addButton('Open in K3B', QMessageBox.ButtonRole.ActionRole)
         btn_wodim = msg.addButton('Burn with wodim', QMessageBox.ButtonRole.ActionRole)
-        btn_skip = msg.addButton('Skip', QMessageBox.RejectRole)
+        btn_skip = msg.addButton('Skip', QMessageBox.ButtonRole.RejectRole)
         msg.setDefaultButton(btn_skip)
         msg.exec()
 
