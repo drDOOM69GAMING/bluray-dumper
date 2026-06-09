@@ -69,7 +69,7 @@ Place AACS keys at `~/.config/aacs/KEYDB.cfg` and BD+ data at `~/.config/bdplus/
 - **Compression** with HandBrakeCLI or ffmpeg GPU (VAAPI/AMF/NVENC/QSV) — auto-detected
 - **ffmpeg fallback** — if HandBrakeCLI exits 0 with no output, ffmpeg is used automatically
 - **Direct-to-MKV (remux)** — `ffmpeg -c copy`, no re-encode, no ISO
-- **AVCHD ISO** — remux MKV → M2TS → BDMV structure → mkudffs UDF 2.50 ISO (ConvertXToHD compatible)
+- **AVCHD ISO** — remux MKV → M2TS → BDMV structure → mkudffs UDF 2.50 ISO
 - **DVD-Video ISO** — ffmpeg MPEG-2 encode → dvdauthor → genisoimage UDF ISO
 - **GPU encode** — auto-detects h264_vaapi, h264_amf, h264_nvenc, h264_qsv in priority order
 - **Burn ISO** — after creation or from ISO browser: "Open in K3B" or "Burn with wodim" (pkexec)
@@ -101,6 +101,5 @@ All operations logged to `~/bluray_dumper.log`. Crash dumps written to `~/bluray
 
 ## Player Compatibility
 
-- **AVCHD ISO** (mkudffs, UDF 2.50): works on PS3, most standalone Blu-ray players, ConvertXToHD
-- **AVCHD ISO**: PS4 not supported (dropped AVCHD disc support in firmware 3.00)
+- **AVCHD ISO** (mkudffs, UDF 2.50): works on PS3, PS4, most standalone Blu-ray players
 - **DVD-Video ISO**: universal DVD player compatibility
