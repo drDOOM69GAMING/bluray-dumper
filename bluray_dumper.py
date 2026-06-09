@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sys, os, struct, subprocess, time, shutil, signal, logging, traceback, hashlib, sqlite3, json, ast, glob, faulthandler, threading, platform
+import sys, os, re, struct, subprocess, time, shutil, signal, logging, traceback, hashlib, sqlite3, json, ast, glob, faulthandler, threading, platform
 from pathlib import Path
 from datetime import timedelta
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -563,6 +563,18 @@ def _find_vaapi_device():
     return fallback
 
 
+def _probe_duration(path):
+    try:
+        r = subprocess.run(
+            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+             '-of', 'csv=p=0', str(path)],
+            capture_output=True, text=True, timeout=30)
+        return float(r.stdout.strip())
+    except Exception as e:
+        log.warning('ffprobe duration failed: %s', e)
+        return 0
+
+
 class SettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -918,6 +930,7 @@ class ISOWorker(QThread):
 class CompressWorker(QThread):
     finished = pyqtSignal(int, str)
     output_line = pyqtSignal(str)
+    progress_updated = pyqtSignal(int, str)
 
     def __init__(self, source_dir, output_path, target_bytes=0):
         super().__init__()
@@ -925,6 +938,8 @@ class CompressWorker(QThread):
         self.output_path = output_path
         self.target_bytes = target_bytes
         self._process = None
+        self.encoder_name = ''
+        self._total_dur = 0
 
     def run(self):
         stream_dir = Path(self.source_dir) / 'BDMV' / 'STREAM'
@@ -937,12 +952,15 @@ class CompressWorker(QThread):
             return
         main_movie = max(m2ts_files, key=lambda f: f.stat().st_size)
 
+        self._total_dur = self._get_duration(main_movie)
         gpu_encoder, _ = self._detect_gpu_encoder()
 
         if gpu_encoder:
             log.info('GPU encoder detected (%s), using ffmpeg with hardware acceleration', gpu_encoder)
+            self.encoder_name = f'ffmpeg {gpu_encoder}'
             self._ffmpeg_encode(main_movie)
         elif tool_available('HandBrakeCLI'):
+            self.encoder_name = 'HandBrakeCLI'
             cmd = self._build_handbrake_cmd(main_movie)
             log.info('Starting compression (HandBrakeCLI): %s', ' '.join(cmd))
             try:
@@ -954,6 +972,10 @@ class CompressWorker(QThread):
                     if line:
                         log.debug('[HandBrakeCLI] %s', line)
                         self.output_line.emit(line)
+                        m = re.search(r'(\d+\.?\d*)\s*%\s*\(', line)
+                        if m:
+                            pct = int(float(m.group(1)))
+                            self.progress_updated.emit(pct, '')
                 self._process.stdout.close()
                 self._process.wait()
                 log.info('HandBrakeCLI exited with code %d', self._process.returncode)
@@ -978,6 +1000,8 @@ class CompressWorker(QThread):
                 QApplication.processEvents()
 
         if tool_available('ffmpeg'):
+            if not self.encoder_name:
+                self.encoder_name = 'ffmpeg'
             self._ffmpeg_encode(main_movie)
         else:
             self.finished.emit(-1, 'Neither HandBrakeCLI nor ffmpeg is available for compression.')
@@ -1007,15 +1031,30 @@ class CompressWorker(QThread):
         return cmd
 
     def _get_duration(self, main_movie):
+        return _probe_duration(main_movie)
+
+    @staticmethod
+    def _find_english_audio_idx(main_movie):
         try:
             r = subprocess.run(
-                ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                ['ffprobe', '-v', 'error', '-show_entries',
+                 'stream=index,codec_type:stream_tags=language',
                  '-of', 'csv=p=0', str(main_movie)],
                 capture_output=True, text=True, timeout=30)
-            return float(r.stdout.strip())
+            audio_count = 0
+            for line in r.stdout.strip().split('\n'):
+                line = line.strip()
+                if not line:
+                    continue
+                cols = line.split(',')
+                if len(cols) >= 2 and cols[1] == 'audio':
+                    lang = cols[2].strip().lower() if len(cols) > 2 and cols[2].strip() else ''
+                    if lang == 'eng':
+                        return audio_count
+                    audio_count += 1
         except Exception as e:
-            log.warning('ffprobe duration failed: %s', e)
-            return 0
+            log.warning('ffprobe audio language detection failed: %s', e)
+        return 0
 
     def _ffmpeg_encode(self, main_movie):
         gpu_encoder, gpu_opts = self._detect_gpu_encoder()
@@ -1029,9 +1068,10 @@ class CompressWorker(QThread):
             cmd += ['-c:v', 'libx264', '-preset', 'slower',
                     '-profile:v', 'high', '-level', '4.0']
 
+        audio_idx = self._find_english_audio_idx(main_movie)
         cmd += ['-pix_fmt', 'yuv420p',
                 '-c:a', 'ac3', '-b:a', '448k',
-                '-map', '0:v:0', '-map', '0:a:m:language:eng',
+                '-map', '0:v:0', '-map', f'0:a:{audio_idx}',
                 '-y', str(self.output_path)]
 
         if self.target_bytes > 0:
@@ -1092,6 +1132,13 @@ class CompressWorker(QThread):
                 if line:
                     log.debug('[%s] %s', label, line)
                     self.output_line.emit(line)
+                    m = re.search(r'time=(\d+):(\d+):(\d+)\.(\d+)', line)
+                    if m and self._total_dur > 0:
+                        cur = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+                        pct = int(cur * 100 / self._total_dur)
+                        sm = re.search(r'speed=([\d.]+)x', line)
+                        spd = sm.group(1) + 'x' if sm else ''
+                        self.progress_updated.emit(min(pct, 99), spd)
             self._process.stdout.close()
             self._process.wait()
             log.info('%s exited with code %d', label, self._process.returncode)
@@ -1119,12 +1166,14 @@ class CompressWorker(QThread):
 class RemuxWorker(QThread):
     finished = pyqtSignal(int, str)
     output_line = pyqtSignal(str)
+    progress_updated = pyqtSignal(int, str)
 
     def __init__(self, source_dir, output_path):
         super().__init__()
         self.source_dir = source_dir
         self.output_path = output_path
         self._process = None
+        self._total_dur = 0
 
     def run(self):
         stream_dir = Path(self.source_dir) / 'BDMV' / 'STREAM'
@@ -1136,6 +1185,7 @@ class RemuxWorker(QThread):
             self.finished.emit(-1, 'No M2TS files found')
             return
         main_movie = max(m2ts_files, key=lambda f: f.stat().st_size)
+        self._total_dur = _probe_duration(main_movie)
 
         cmd = ['ffmpeg', '-i', str(main_movie),
                '-map', '0', '-c', 'copy',
@@ -1150,6 +1200,13 @@ class RemuxWorker(QThread):
                 if line:
                     log.debug('[ffmpeg remux] %s', line)
                     self.output_line.emit(line)
+                    m = re.search(r'time=(\d+):(\d+):(\d+)\.(\d+)', line)
+                    if m and self._total_dur > 0:
+                        cur = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+                        pct = int(cur * 100 / self._total_dur)
+                        sm = re.search(r'speed=([\d.]+)x', line)
+                        spd = sm.group(1) + 'x' if sm else ''
+                        self.progress_updated.emit(min(pct, 99), spd)
             self._process.stdout.close()
             self._process.wait()
             log.info('ffmpeg remux exited with code %d', self._process.returncode)
@@ -1653,6 +1710,12 @@ class BluRayDumperWindow(QMainWindow):
             self.tray_icon.show()
         else:
             log.debug('System tray not available')
+
+        menubar = self.menuBar()
+        opt_menu = menubar.addMenu('READ')
+        disc_act = QAction('Disclaimer', self)
+        disc_act.triggered.connect(self._show_disclaimer)
+        opt_menu.addAction(disc_act)
 
         self.status_label = QLabel('Starting...')
         self.status_label.setStyleSheet('font-size: 14px; font-weight: bold;')
@@ -2250,6 +2313,16 @@ class BluRayDumperWindow(QMainWindow):
     def on_dump_output(self, line):
         self.log_output.setText(line[-80:])
 
+    def _on_encode_progress(self, pct, speed_text):
+        self.progress_bar.setValue(pct)
+        label = f'{pct}%'
+        if self.elapsed > 0 and pct > 0:
+            eta_s = int((self.elapsed * 100 / pct) - self.elapsed)
+            label += f'  |  ETA {str(timedelta(seconds=eta_s))}'
+        if speed_text:
+            label += f'  |  {speed_text}'
+        self.speed_label.setText(label)
+
     def update_progress(self):
         if not self._dump_path or not self._dump_path.exists():
             return
@@ -2618,6 +2691,22 @@ class BluRayDumperWindow(QMainWindow):
         self.open_folder_btn.setEnabled(False)
         log.info('State cleared by user')
 
+    def _show_disclaimer(self):
+        QMessageBox.information(self, 'Disclaimer',
+            'Do not use this software to make illegal copies of copyrighted '
+            'material. This software is intended only for creating backup '
+            'copies of media that you legally own and are authorized to '
+            'duplicate. Users are responsible for complying with all '
+            'applicable copyright laws and regulations in their jurisdiction.\n\n'
+            'Warning\n\n'
+            'This software is provided as is, without any decryption methods, '
+            'decryption capabilities, keys, or access credentials of any kind. '
+            'We do not provide, distribute, assist with obtaining, or offer '
+            'support for finding such methods or keys. Our obligation is '
+            'limited to providing this front end software, and the '
+            'functionality it offers should be considered sufficient for its '
+            'intended purpose.')
+
     def _enter_working_state(self, show_progress=True, show_timer=True,
                               show_speed=True, indeterminate=False,
                               status_text='Working...', log_text='',
@@ -2711,14 +2800,15 @@ class BluRayDumperWindow(QMainWindow):
         out_name = sanitize_filename(self._dump_path.name) + '_compressed.mkv'
         out_path = self._dump_path.parent / out_name
 
-        self._enter_working_state(indeterminate=True, status_text='Compressing...',
+        self._enter_working_state(indeterminate=False, status_text='Compressing...',
                                   log_text='Compressing main movie...',
-                                  show_speed=False)
+                                  show_speed=True)
 
         self.compress_worker = CompressWorker(
             str(self._dump_path), str(out_path), target_bytes)
         self.compress_worker.finished.connect(self.on_compress_finished)
         self.compress_worker.output_line.connect(self.on_dump_output)
+        self.compress_worker.progress_updated.connect(self._on_encode_progress)
         self.compress_worker.start()
         log.info('Compression started: %s -> %s', self._dump_path, out_path)
 
@@ -2731,12 +2821,13 @@ class BluRayDumperWindow(QMainWindow):
             return
         out_name = sanitize_filename(self._dump_path.name) + '.mkv'
         out_path = self._dump_path.parent / out_name
-        self._enter_working_state(indeterminate=True, status_text='Remuxing to MKV...',
+        self._enter_working_state(indeterminate=False, status_text='Remuxing to MKV...',
                                   log_text='Remuxing main movie (direct copy, no re-encode)...',
-                                  show_speed=False)
+                                  show_speed=True)
         self.remux_worker = RemuxWorker(str(self._dump_path), str(out_path))
         self.remux_worker.finished.connect(self.on_remux_finished)
         self.remux_worker.output_line.connect(self.on_dump_output)
+        self.remux_worker.progress_updated.connect(self._on_encode_progress)
         self.remux_worker.start()
         log.info('Remux started: %s -> %s', self._dump_path, out_path)
 
@@ -3014,7 +3105,8 @@ class BluRayDumperWindow(QMainWindow):
 
         if retcode != 0:
             self.status_label.setText('Compression failed')
-            msg = error or f'HandBrakeCLI exited with code {retcode}'
+            ename = getattr(self.compress_worker, 'encoder_name', 'encoder')
+            msg = error or f'{ename} exited with code {retcode}'
             self.log_output.setText(f'Compression failed: {msg}')
             QMessageBox.critical(self, 'Compression Failed', msg)
             log.error('Compression failed: %s', msg)
@@ -3022,15 +3114,15 @@ class BluRayDumperWindow(QMainWindow):
             mkv_path = Path(self.compress_worker.output_path)
 
             if not mkv_path.is_file() or mkv_path.stat().st_size < 10 * 1024 * 1024:
-                log.error('HandBrakeCLI reported success but no valid output at %s', mkv_path)
+                log.error('Compression reported success but no valid output at %s', mkv_path)
                 self.status_label.setText('Compression failed')
                 self.log_output.setText(
-                    'HandBrakeCLI reported success but created no output.\n'
-                    'The --size option may not be supported by this version.')
+                    'Encoder reported success but created no output.\n'
+                    'The size target may not be supported by this version.')
                 QMessageBox.critical(self, 'Compression Failed',
-                    'HandBrakeCLI exited with code 0 but did not produce a valid MKV.\n'
-                    'Check that your HandBrakeCLI version supports --vb / two-pass,\n'
-                    'or try updating HandBrakeCLI. See log for details.')
+                    'Compression exited with code 0 but did not produce a valid MKV.\n'
+                    'Check that your version supports the requested options.\n'
+                    'See log for details.')
                 return
 
             self.status_label.setText('Compression complete')
@@ -3123,14 +3215,6 @@ class BluRayDumperWindow(QMainWindow):
                 f'Compressed MKV saved as:\n{mkv_path}')
 
     @staticmethod
-    def _bluray_muxer_available():
-        try:
-            r = subprocess.run(['ffmpeg', '-muxers'], capture_output=True, text=True, timeout=10)
-            return 'bluray' in r.stdout
-        except Exception:
-            return False
-
-    @staticmethod
     def _run_subprocess_streaming(cmd, timeout=3600, label='process'):
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         if result.returncode != 0:
@@ -3164,74 +3248,50 @@ class BluRayDumperWindow(QMainWindow):
         if avchd_dir.exists():
             shutil.rmtree(avchd_dir)
 
-        if self._bluray_muxer_available():
-            log.info('AVCHD: using ffmpeg bluray muxer')
-            rc, out, err = self._run_subprocess_streaming(
-                ['ffmpeg', '-i', str(mkv_path), '-c:v', 'copy', '-c:a', 'ac3', '-b:a', '448k',
-                 '-f', 'bluray', '-muxrate', '30000000', str(avchd_dir)],
-                label='ffmpeg_bluray')
-            if rc != 0:
-                err_msg = (err[-500:] if err else 'unknown error').strip()
-                self.status_label.setText('AVCHD mux failed')
-                self.log_output.setText(err_msg)
-                QMessageBox.critical(self, 'AVCHD Error',
-                    f'ffmpeg bluray muxer failed (code {rc}):\n{err_msg}')
-                shutil.rmtree(avchd_dir, ignore_errors=True)
-                return
+        log.info('AVCHD: remuxing MKV to M2TS')
+        self.log_output.setText('Remuxing to M2TS...')
+        QApplication.processEvents()
+        m2ts_path = avchd_dir / 'temp.m2ts'
+        avchd_dir.mkdir(parents=True, exist_ok=True)
 
-            bdmv = avchd_dir / 'BDMV'
-            if not bdmv.is_dir():
-                QMessageBox.critical(self, 'AVCHD Error',
-                    'ffmpeg did not create the BDMV directory structure.\n'
-                    'The bluray muxer may not be supported in this ffmpeg build.\n\n'
-                    f'Check the log for details from ffmpeg bluray muxer.')
-                shutil.rmtree(avchd_dir, ignore_errors=True)
-                return
-        else:
-            log.info('AVCHD: bluray muxer not available, using fallback remux')
-            self.log_output.setText('ffmpeg bluray muxer not available, using fallback...')
-            QApplication.processEvents()
-            m2ts_path = avchd_dir / 'temp.m2ts'
-            avchd_dir.mkdir(parents=True, exist_ok=True)
+        rc, out, err = self._run_subprocess_streaming(
+            ['ffmpeg', '-i', str(mkv_path), '-c:v', 'copy', '-c:a', 'ac3', '-b:a', '448k',
+             '-f', 'mpegts', '-mpegts_m2ts_mode', '1', '-y', str(m2ts_path)],
+            label='ffmpeg_m2ts')
+        if rc != 0:
+            err_msg = (err[-500:] if err else 'unknown error').strip()
+            self.status_label.setText('AVCHD remux failed')
+            self.log_output.setText(err_msg)
+            QMessageBox.critical(self, 'AVCHD Error',
+                f'ffmpeg remux to M2TS failed (code {rc}):\n{err_msg}')
+            shutil.rmtree(avchd_dir, ignore_errors=True)
+            return
 
-            rc, out, err = self._run_subprocess_streaming(
-                ['ffmpeg', '-i', str(mkv_path), '-c:v', 'copy', '-c:a', 'ac3', '-b:a', '448k',
-                 '-f', 'mpegts', '-mpegts_m2ts_mode', '1', '-y', str(m2ts_path)],
-                label='ffmpeg_m2ts')
-            if rc != 0:
-                err_msg = (err[-500:] if err else 'unknown error').strip()
-                self.status_label.setText('AVCHD remux failed')
-                self.log_output.setText(err_msg)
-                QMessageBox.critical(self, 'AVCHD Error',
-                    f'ffmpeg remux to M2TS failed (code {rc}):\n{err_msg}')
-                shutil.rmtree(avchd_dir, ignore_errors=True)
-                return
+        if m2ts_path.stat().st_size < 10 * 1024 * 1024:
+            QMessageBox.critical(self, 'AVCHD Error',
+                f'M2TS is only {m2ts_path.stat().st_size / (1024*1024):.1f} MB.\n'
+                'The video stream may be corrupt.\n'
+                f'Check {LOG_FILE} for ffprobe/ffmpeg output during remux.')
+            shutil.rmtree(avchd_dir, ignore_errors=True)
+            return
 
-            if m2ts_path.stat().st_size < 10 * 1024 * 1024:
-                QMessageBox.critical(self, 'AVCHD Error',
-                    f'M2TS is only {m2ts_path.stat().st_size / (1024*1024):.1f} MB.\n'
-                    'The video stream may be corrupt.\n'
-                    f'Check {LOG_FILE} for ffprobe/ffmpeg output during remux.')
-                shutil.rmtree(avchd_dir, ignore_errors=True)
-                return
-
-            self.log_output.setText('Building AVCHD structure (fallback)...')
-            QApplication.processEvents()
-            try:
-                create_avchd_structure(m2ts_path, avchd_dir)
-            except Exception as e:
-                self.status_label.setText('AVCHD structure failed')
-                err_msg = traceback.format_exc()
-                log.error('AVCHD structure creation failed:\n%s', err_msg)
-                self.log_output.setText(str(e))
-                QMessageBox.critical(self, 'AVCHD Error',
-                    f'AVCHD structure creation failed:\n{e}\n\n'
-                    f'Check {LOG_FILE} for details.')
-                shutil.rmtree(avchd_dir, ignore_errors=True)
-                return
-            finally:
-                if m2ts_path.exists():
-                    m2ts_path.unlink()
+        self.log_output.setText('Building AVCHD structure...')
+        QApplication.processEvents()
+        try:
+            create_avchd_structure(m2ts_path, avchd_dir)
+        except Exception as e:
+            self.status_label.setText('AVCHD structure failed')
+            err_msg = traceback.format_exc()
+            log.error('AVCHD structure creation failed:\n%s', err_msg)
+            self.log_output.setText(str(e))
+            QMessageBox.critical(self, 'AVCHD Error',
+                f'AVCHD structure creation failed:\n{e}\n\n'
+                f'Check {LOG_FILE} for details.')
+            shutil.rmtree(avchd_dir, ignore_errors=True)
+            return
+        finally:
+            if m2ts_path.exists():
+                m2ts_path.unlink()
 
         cert_dir = avchd_dir / 'CERTIFICATE'
         cert_dir.mkdir(parents=True, exist_ok=True)
@@ -3281,16 +3341,14 @@ class BluRayDumperWindow(QMainWindow):
                 'set -e',
                 f'ISO="{iso_path}"',
                 f'SRC="{avchd_dir}"',
-                'if mountpoint -q /mnt; then',
-                '  echo "ERROR: /mnt is already mounted" >&2',
-                '  exit 1',
-                'fi',
+                'MNT=$(mktemp -d /tmp/avchd_mount_XXXXXX)',
+                'trap "rmdir \"$MNT\" 2>/dev/null; exit" EXIT INT TERM',
                 'LOOP=$(losetup -f --show "$ISO")',
-                'mount -o rw "$LOOP" /mnt',
-                'cp -a "$SRC/BDMV" /mnt/',
-                'cp -a "$SRC/CERTIFICATE" /mnt/',
+                'mount -o rw "$LOOP" "$MNT"',
+                'cp -a "$SRC/BDMV" "$MNT/"',
+                'cp -a "$SRC/CERTIFICATE" "$MNT/"',
                 'sync',
-                'umount /mnt',
+                'umount "$MNT"',
                 'losetup -d "$LOOP"',
             ]
             with open(script_path, 'w') as f:
