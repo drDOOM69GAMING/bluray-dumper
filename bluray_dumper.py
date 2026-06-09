@@ -11,8 +11,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QSystemTrayIcon, QMenu, QTableWidget, QHeaderView,
                              QAbstractItemView, QSplitter, QTableWidgetItem,
                              QStyle)
-from PyQt6.QtCore import QTimer, Qt, QThread, pyqtSignal, QSettings
-from PyQt6.QtGui import QTextCursor, QIcon, QAction
+from PyQt6.QtCore import QTimer, Qt, QThread, pyqtSignal, QSettings, QPointF, QRectF
+from PyQt6.QtGui import QTextCursor, QIcon, QAction, QPainter, QColor, QPen, QFont, QBrush, QRadialGradient, QConicalGradient
 
 AACS_DIR = Path.home() / '.config' / 'aacs'
 BDPLUS_DIR = Path.home() / '.config' / 'bdplus'
@@ -139,7 +139,7 @@ def install_missing_tools(tools, parent=None, pm=None):
     if parent:
         msg = QMessageBox(parent)
         msg.setWindowTitle('Install Missing Tools')
-        msg.setIcon(QMessageBox.Question)
+        msg.setIcon(QMessageBox.Icon.Question)
         msg.setText(f'The following tools are required:\n{", ".join(tools)}')
         msg.setInformativeText(
             f'Install packages with {pm}?\n\n'
@@ -174,7 +174,7 @@ def ensure_tool(name, parent=None, pm=None):
     if pm and shutil.which('pkexec') and parent:
         msg = QMessageBox(parent)
         msg.setWindowTitle('Missing Tool')
-        msg.setIcon(QMessageBox.Question)
+        msg.setIcon(QMessageBox.Icon.Question)
         msg.setText(f'{name} is required for this operation.')
         btn_install = msg.addButton('Install', QMessageBox.ActionRole)
         msg.addButton('Cancel', QMessageBox.RejectRole)
@@ -1655,11 +1655,81 @@ class ProfileManager:
         self.settings.endGroup()
 
 
+class DiscSpeedWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(90, 90)
+        self._speed_mb_s = 0.0
+        self._angle = 0.0
+        self._anim_timer = QTimer(self)
+        self._anim_timer.timeout.connect(self._tick)
+        self._anim_timer.start(40)
+
+    def set_speed(self, mb_s):
+        self._speed_mb_s = mb_s
+
+    def _tick(self):
+        s = abs(self._speed_mb_s)
+        if s > 0.1:
+            increment = max(0.3, min(s * 0.8, 15.0))
+            self._angle = (self._angle + increment) % 360
+        else:
+            self._angle = self._angle * 0.95
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        cx, cy = w / 2, h / 2
+        outer = min(w, h) / 2 - 4
+
+        g = QRadialGradient(cx - outer * 0.2, cy - outer * 0.2, outer * 1.2)
+        g.setColorAt(0, QColor(80, 80, 85))
+        g.setColorAt(0.7, QColor(45, 45, 50))
+        g.setColorAt(1, QColor(25, 25, 30))
+        p.setPen(QPen(QColor(160, 160, 160), 1))
+        p.setBrush(QBrush(g))
+        p.drawEllipse(QPointF(cx, cy), outer, outer)
+
+        p.save()
+        p.translate(cx, cy)
+        p.rotate(self._angle)
+        cg = QConicalGradient(QPointF(0, 0), 0)
+        cg.setColorAt(0.0, QColor(255, 255, 255, 50))
+        cg.setColorAt(0.125, QColor(100, 200, 255, 40))
+        cg.setColorAt(0.25, QColor(200, 100, 255, 30))
+        cg.setColorAt(0.375, QColor(255, 200, 100, 40))
+        cg.setColorAt(0.5, QColor(100, 255, 150, 45))
+        cg.setColorAt(0.625, QColor(255, 100, 100, 35))
+        cg.setColorAt(0.75, QColor(150, 150, 255, 40))
+        cg.setColorAt(0.875, QColor(255, 255, 100, 30))
+        cg.setColorAt(1.0, QColor(255, 255, 255, 50))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(cg))
+        p.drawEllipse(QPointF(0, 0), outer - 2, outer - 2)
+        p.restore()
+
+        inner = outer * 0.18
+        p.setPen(QPen(QColor(120, 120, 120), 1))
+        p.setBrush(QBrush(QColor(35, 35, 40)))
+        p.drawEllipse(QPointF(cx, cy), inner, inner)
+        p.setBrush(QBrush(QColor(240, 240, 240)))
+        p.drawEllipse(QPointF(cx, cy), inner * 0.35, inner * 0.35)
+
+        if self._speed_mb_s > 0:
+            txt = f'{self._speed_mb_s:.1f} MB/s'
+            p.setPen(QColor(180, 200, 220))
+            p.setFont(QFont('sans-serif', 8))
+            tr = QRectF(0, h - 16, w, 16)
+            p.drawText(tr, Qt.AlignmentFlag.AlignCenter, txt)
+
+
 class BluRayDumperWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('Blu-ray Dumper')
-        self.resize(720, 700)
+        self.resize(720, 750)
 
         self.disc_label = None
         self.disc_size = 0
@@ -1719,7 +1789,6 @@ class BluRayDumperWindow(QMainWindow):
 
         self.status_label = QLabel('Starting...')
         self.status_label.setStyleSheet('font-size: 14px; font-weight: bold;')
-        layout.addWidget(self.status_label)
 
         disc_frame = QFrame()
         disc_frame.setFrameStyle(QFrame.Shape.StyledPanel)
@@ -1727,7 +1796,18 @@ class BluRayDumperWindow(QMainWindow):
         self.disc_info = QLabel('Checking system...')
         self.disc_info.setStyleSheet('color: #666;')
         dfl.addWidget(self.disc_info)
-        layout.addWidget(disc_frame)
+
+        top_row = QHBoxLayout()
+        top_left = QVBoxLayout()
+        top_left.setSpacing(4)
+        top_left.addWidget(self.status_label)
+        top_left.addWidget(disc_frame)
+        top_row.addLayout(top_left)
+        top_row.addStretch()
+        self._disc_widget = DiscSpeedWidget()
+        self._disc_widget.setToolTip('Disc read speed')
+        top_row.addWidget(self._disc_widget, alignment=Qt.AlignmentFlag.AlignTop)
+        layout.addLayout(top_row)
 
         btn_row1 = QHBoxLayout()
         self.refresh_btn = QPushButton('Refresh Disc Detection')
@@ -1867,6 +1947,24 @@ class BluRayDumperWindow(QMainWindow):
         queue_layout.addLayout(q_btn_row)
         layout.addWidget(queue_group)
 
+        bottom_frame = QFrame()
+        bottom_frame.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Sunken)
+        bottom_frame.setStyleSheet('QFrame { background: #f0f0f0; border: 1px solid #ccc; }')
+        bottom_layout = QVBoxLayout(bottom_frame)
+        bottom_layout.setContentsMargins(6, 1, 6, 1)
+        bottom_layout.setSpacing(0)
+        self._bottom_status = QLabel('Starting...')
+        self._bottom_status.setStyleSheet('color: #555; font-size: 11px;')
+        bottom_layout.addWidget(self._bottom_status)
+        self._bottom_quote = QLabel(self._pick_random_quote())
+        self._bottom_quote.setStyleSheet('color: #888; font-style: italic; font-size: 11px;')
+        bottom_layout.addWidget(self._bottom_quote)
+        layout.addWidget(bottom_frame)
+
+        self._bottom_sync_timer = QTimer()
+        self._bottom_sync_timer.timeout.connect(self._sync_bottom_bar)
+        self._bottom_sync_timer.start(1000)
+
         self.progress_timer = QTimer()
         self.progress_timer.timeout.connect(self.update_progress)
 
@@ -1901,7 +1999,7 @@ class BluRayDumperWindow(QMainWindow):
             if pm and shutil.which('pkexec'):
                 msg = QMessageBox(self)
                 msg.setWindowTitle('Install Missing Tools')
-                msg.setIcon(QMessageBox.Question)
+                msg.setIcon(QMessageBox.Icon.Question)
                 msg.setText('Required tools are missing.')
                 msg.setInformativeText(
                     f'Missing: {", ".join(missing)}\n\n'
@@ -2321,6 +2419,9 @@ class BluRayDumperWindow(QMainWindow):
             label += f'  |  ETA {str(timedelta(seconds=eta_s))}'
         if speed_text:
             label += f'  |  {speed_text}'
+            m = re.search(r'([\d.]+)', speed_text)
+            if m:
+                self._disc_widget.set_speed(float(m.group(1)))
         self.speed_label.setText(label)
 
     def update_progress(self):
@@ -2337,6 +2438,7 @@ class BluRayDumperWindow(QMainWindow):
                 elapsed_h = self.elapsed / 3600
                 speed_gb_h = (current / (1024**3)) / elapsed_h
                 speed_mb_s = (current / (1024**2)) / self.elapsed
+                self._disc_widget.set_speed(speed_mb_s)
                 remaining = self.disc_size - current
                 eta_s = remaining / (current / self.elapsed) if current > 0 else 0
                 eta_str = str(timedelta(seconds=int(eta_s))) if eta_s > 0 else ''
@@ -2359,6 +2461,7 @@ class BluRayDumperWindow(QMainWindow):
         self.timer.stop()
         self.progress_timer.stop()
         self.speed_label.setVisible(False)
+        self._disc_widget.set_speed(0)
 
         if retcode == 0:
             self.notify_user('Blu-ray Dumper', 'Disc dump completed successfully')
@@ -2513,6 +2616,7 @@ class BluRayDumperWindow(QMainWindow):
         log.info('ISO creation finished with code %d', retcode)
         self.timer.stop()
         self.speed_label.setVisible(False)
+        self._disc_widget.set_speed(0)
         self.progress_bar.setRange(0, 100)
         self._working = False
         self.reset_buttons()
@@ -3094,6 +3198,7 @@ class BluRayDumperWindow(QMainWindow):
             self.eject_disc()
         self._pending_auto_delete = False
         self._pending_auto_eject = False
+        self._disc_widget.set_speed(0)
 
     def on_compress_finished(self, retcode, error):
         if self._cancelled:
@@ -3102,6 +3207,8 @@ class BluRayDumperWindow(QMainWindow):
         self.timer.stop()
         self._working = False
         self.reset_buttons()
+
+        handled = False
 
         if retcode != 0:
             self.status_label.setText('Compression failed')
@@ -3129,7 +3236,7 @@ class BluRayDumperWindow(QMainWindow):
             self.log_output.setText('Compressed MKV created.')
 
             if tool_available('ffmpeg') and self._is_dvd_target(self.compress_target):
-                self._offer_dvd_output(mkv_path)
+                handled = self._offer_dvd_output(mkv_path)
             else:
                 QMessageBox.information(
                     self, 'Compression Done',
@@ -3140,10 +3247,11 @@ class BluRayDumperWindow(QMainWindow):
         self.progress_bar.setVisible(False)
         self.timer_label.setVisible(False)
 
-        if hasattr(self, '_batch_compress_queue'):
-            self._process_batch_compress()
-        else:
-            self.queue_next()
+        if not handled:
+            if hasattr(self, '_batch_compress_queue'):
+                self._process_batch_compress()
+            else:
+                self.queue_next()
 
     def on_remux_finished(self, retcode, error):
         if self._cancelled:
@@ -3204,15 +3312,47 @@ class BluRayDumperWindow(QMainWindow):
             QMessageBox.information(
                 self, 'Compression Done',
                 f'Compressed MKV saved as:\n{mkv_path}')
-            return
+            return False
+        iso_ok = False
         if self._dvd_vob_rb.isChecked():
-            self._create_dvd_video_iso(mkv_path)
+            iso_ok = self._create_dvd_video_iso(mkv_path)
         elif self._dvd_avchd_rb.isChecked():
-            self._create_avchd_iso(mkv_path)
+            iso_ok = self._create_avchd_iso(mkv_path)
         else:
             QMessageBox.information(
                 self, 'Compression Done',
                 f'Compressed MKV saved as:\n{mkv_path}')
+            return False
+        if iso_ok:
+            self._cleanup_after_burn(mkv_path)
+            return True
+        return False
+
+    def _cleanup_after_burn(self, mkv_path):
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Clean Up')
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel(
+            'DVD/AVCHD creation complete.\n\n'
+            'Temporary working directory can be deleted.'))
+        cb_del = QCheckBox('Delete temporary files')
+        cb_del.setChecked(True)
+        layout.addWidget(cb_del)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
+        layout.addWidget(btns)
+        btns.accepted.connect(dlg.accept)
+        dlg.exec()
+        deleted = False
+        if cb_del.isChecked():
+            d = Path(self._current_dvd_workdir) if hasattr(self, '_current_dvd_workdir') else None
+            if d and d.is_dir():
+                shutil.rmtree(d, ignore_errors=True)
+                log.info('Deleted temp workdir: %s', d)
+                deleted = True
+        msg = 'DVD/AVCHD output created from:\n' + str(mkv_path)
+        if deleted:
+            msg += '\n\nTemporary files deleted.'
+        QMessageBox.information(self, 'Complete', msg)
 
     @staticmethod
     def _run_subprocess_streaming(cmd, timeout=3600, label='process'):
@@ -3370,10 +3510,12 @@ class BluRayDumperWindow(QMainWindow):
                 os.unlink(script_path)
 
         shutil.rmtree(avchd_dir, ignore_errors=True)
+        self._current_dvd_workdir = str(avchd_dir)
         self.status_label.setText('AVCHD DVD ISO created')
         self.log_output.setText(f'Created: {iso_path.name}')
         self._burn_iso_dialog(iso_path)
         log.info('AVCHD ISO created: %s', iso_path)
+        return True
 
     @staticmethod
     def _detect_dvd_format(mpeg_path):
@@ -3495,15 +3637,17 @@ class BluRayDumperWindow(QMainWindow):
             return
 
         shutil.rmtree(dvd_dir, ignore_errors=True)
+        self._current_dvd_workdir = str(dvd_dir)
         self.status_label.setText('DVD-Video ISO created')
         self.log_output.setText(f'Created: {iso_path.name}')
         self._burn_iso_dialog(iso_path)
         log.info('DVD-Video ISO created: %s', iso_path)
+        return True
 
     def _burn_iso_dialog(self, iso_path):
         msg = QMessageBox(self)
         msg.setWindowTitle('Burn DVD')
-        msg.setIcon(QMessageBox.Question)
+        msg.setIcon(QMessageBox.Icon.Question)
         msg.setText(f'ISO ready:\n{iso_path.name}')
         msg.setInformativeText('How would you like to burn this disc?')
         btn_k3b = msg.addButton('Open in K3B', QMessageBox.ActionRole)
@@ -3629,6 +3773,17 @@ class BluRayDumperWindow(QMainWindow):
         except Exception as e:
             log.warning('Catalog insert failed: %s', e)
 
+    def _pick_random_quote(self):
+        import random
+        return random.choice(IMG_QUOTES)
+
+    def _sync_bottom_bar(self):
+        dev = self.device_path if hasattr(self, 'device_path') else ''
+        label = ''
+        if hasattr(self, 'disc_label') and self.disc_label:
+            label = f'  |  {self.disc_label}'
+        self._bottom_status.setText(f'{dev}{label}' if dev else 'No drive')
+
 
 def global_exception_handler(exc_type, exc_value, exc_tb):
     log.critical('Unhandled exception',
@@ -3676,6 +3831,202 @@ def log_system_info():
     except Exception:
         pass
     log.info('===================')
+
+
+
+
+IMG_QUOTES = [
+    "I'm not insane, I'm just not as sane as you.",
+    "Don't Panic!",
+    "Only two things are infinite: the universe and human stupidity, and I'm not sure about the former.",
+    "All those moments will be lost in time, like tears in rain.",
+    "I'll be back.",
+    "It's only a model.",
+    "Bring me a shrubbery!",
+    "Your money or your life!",
+    "You shall not pass!",
+    "Great success!",
+    "I find your lack of faith disturbing.",
+    "Do or do not. There is no try.",
+    "To infinity and beyond!",
+    "Winter is coming.",
+    "Hasta la vista, baby.",
+    "My precious.",
+    "I see dead people.",
+    "I'm too old for this ****.",
+    "Go ahead, make my day.",
+    "There's no place like home.",
+    "Life is like a box of chocolates. You never know what you're gonna get.",
+    "I feel the need—the need for speed!",
+    "Here's looking at you, kid.",
+    "May the Force be with you.",
+    "The name's Bond, James Bond.",
+    "Elementary, my dear Watson.",
+    "I think, therefore I am.",
+    "Cogito ergo sum.",
+    "I came, I saw, I conquered.",
+    "Veni, vidi, vici.",
+    "I'll have what she's having.",
+    "We're going to need a bigger boat.",
+    "Show me the money!",
+    "You had me at hello.",
+    "I'm walking here!",
+    "Keep your friends close, but your enemies closer.",
+    "With great power comes great responsibility.",
+    "Why so serious?",
+    "I believe whatever doesn't kill you simply makes you... stranger.",
+    "A martini. Shaken, not stirred.",
+    "Bond. James Bond.",
+    "To be or not to be, that is the question.",
+    "The only thing we have to fear is fear itself.",
+    "Ask not what your country can do for you...",
+    "I have a dream.",
+    "Mr. Anderson.",
+    "There is no spoon.",
+    "I know kung fu.",
+    "Follow the white rabbit.",
+    "Ignorance is bliss.",
+    "Resistance is futile.",
+    "Make it so.",
+    "Engage!",
+    "Live long and prosper.",
+    "Beam me up, Scotty.",
+    "Space: the final frontier.",
+    "Fascinating.",
+    "I'm a doctor, not a bricklayer!",
+    "Damn it, Jim!",
+    "It's a trap!",
+    "Never tell me the odds!",
+    "I've got a bad feeling about this.",
+    "Use the Force, Luke.",
+    "Size matters not.",
+    "Judge me by my size, do you?",
+    "Luminous beings are we, not this crude matter.",
+    "Patience you must have, my young padawan.",
+    "Always two there are, no more, no less.",
+    "So this is how liberty dies... with thunderous applause.",
+    "Hello there!",
+    "I have the high ground!",
+    "You underestimate my power!",
+    "I am your father.",
+    "No, I am your father.",
+    "Search your feelings, you know it to be true.",
+    "It's over, Anakin! I have the high ground!",
+    "Another happy landing.",
+    "This is where the fun begins.",
+    "I've been looking forward to this.",
+    "Good relations with the Wookiees, I have.",
+    "Power! Unlimited power!",
+    "Dew it!",
+    "I am the Senate!",
+    "Not yet.",
+    "UNLIMITED POWER!",
+    "I don't like sand.",
+    "Are you threatening me, Master Jedi?",
+    "I am the light.",
+    "The dark side of the Force is a pathway to many abilities some consider to be unnatural.",
+    "Execute Order 66.",
+    "So uncivilized.",
+    "I hate it when he does that.",
+    "Oh, I don't think so.",
+    "Nooooooooo!",
+    "This is the way.",
+    "The greatest teacher, failure is.",
+    "Always in motion is the future.",
+    "Each time you shift, it takes longer.",
+    "Open the pod bay doors, HAL.",
+    "I'm sorry, Dave. I'm afraid I can't do that.",
+    "My god, it's full of stars!",
+    "Race you to the roof!",
+    "Badges? We don't need no stinking badges!",
+    "The stuff that dreams are made of.",
+    "You're gonna need a bigger boat.",
+    "Snakes. Why'd it have to be snakes?",
+    "I am serious. And don't call me Shirley.",
+    "Surely you can't be serious.",
+    "I speak Jive.",
+    "The plane! The plane!",
+    "Danger Zone!",
+    "I want my MTV.",
+    "Video killed the radio star.",
+    "Take the red pill.",
+    "Welcome to the real world.",
+    "I know you are but what am I?",
+    "I coulda been a contender.",
+    "I'm king of the world!",
+    "I'll never let go.",
+    "You jump, I jump.",
+    "Is it safe?",
+    "I am not a number, I am a free man!",
+    "Your number's up!",
+    "Resistance is not futile.",
+    "We are the Borg.",
+    "You will be assimilated.",
+    "Lower your shields and surrender your ships.",
+    "It's not the years, it's the mileage.",
+    "Klaatu barada nikto.",
+    "D'oh!",
+    "Eat my shorts!",
+    "Aye caramba!",
+    "Don't have a cow, man.",
+    "Excellent.",
+    "Unbelievable!",
+    "To the Batmobile!",
+    "I'm the King of the World!",
+    "You can't fight in here! This is the War Room!",
+    "Greed is good.",
+    "You can't handle the truth!",
+    "A census taker once tried to test me. I ate his liver with some fava beans and a nice chianti.",
+    "Round up the usual suspects.",
+    "We'll always have Paris.",
+    "Fasten your seatbelts, it's going to be a bumpy night.",
+    "I'm ready for my close-up.",
+    "Play it again, Sam.",
+    "We rob banks.",
+    "I think this is the beginning of a beautiful friendship.",
+    "Who's on first?",
+    "I'm not a doctor, but I play one on TV.",
+    "What you see is what you get!",
+    "I'm mad as hell and I'm not going to take this anymore!",
+    "Hello. My name is Inigo Montoya. You killed my father. Prepare to die.",
+    "Inconceivable!",
+    "You keep using that word. I do not think it means what you think it means.",
+    "Rodents of Unusual Size? I don't think they exist.",
+    "As you wish.",
+    "Anybody want a peanut?",
+    "Never go in against a Sicilian when death is on the line!",
+    "Have fun storming the castle!",
+    "I'm not a witch, I'm your wife!",
+    "Cake, and grief counseling, will be available at the conclusion of the test.",
+    "The cake is a lie.",
+    "This was a triumph. I'm making a note here: huge success.",
+    "Eat your vegetables.",
+    "Clean your room.",
+    "Wash behind your ears.",
+    "Floss every day.",
+    "Don't forget to make backups.",
+    "Measure twice, cut once.",
+    "Computers are fast; programmers keep it slow.",
+    "I compute, therefore I am.",
+    "There are 10 types of people in the world: those who understand binary and those who don't.",
+    "Do not meddle in the affairs of dragons, for you are crunchy and taste good with ketchup.",
+    "Time is an illusion. Lunchtime doubly so.",
+    "I'd tell you a joke about UDP but you might not get it.",
+    "A computer program does what you tell it to do, not what you want it to do.",
+    "Programming is thinking, not typing.",
+    "Windows 7: You had one job.",
+    "There are only two hard problems in computer science: cache invalidation and naming things.",
+    "Works on my machine.",
+    "It's not a bug, it's a feature.",
+    "I don't always test my code, but when I do, I do it in production.",
+    "The best thing about a boolean is even if you are wrong, you are only off by a bit.",
+    "To understand recursion, you must first understand recursion.",
+    "An undefined problem has an infinite number of solutions.",
+    "Eat, sleep, code, repeat.",
+    "Talk is cheap. Show me the code.",
+    "It's working exactly as designed.",
+    "That's not a bug, that's a feature.",
+]
 
 
 def main():
