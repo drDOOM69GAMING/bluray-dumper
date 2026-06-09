@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sys, os, re, struct, subprocess, time, shutil, signal, logging, traceback, hashlib, sqlite3, json, ast, glob, faulthandler, threading, platform
+import sys, os, re, struct, subprocess, time, shutil, signal, logging, traceback, hashlib, sqlite3, json, ast, glob, faulthandler, threading, platform, random, random
 from pathlib import Path
 from datetime import timedelta
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QAbstractItemView, QSplitter, QTableWidgetItem,
                              QStyle)
 from PyQt6.QtCore import QTimer, Qt, QThread, pyqtSignal, QSettings, QPointF, QRectF
-from PyQt6.QtGui import QTextCursor, QIcon, QAction, QPainter, QColor, QPen, QFont, QBrush, QRadialGradient, QConicalGradient
+from PyQt6.QtGui import QTextCursor, QIcon, QAction, QPainter, QColor, QPen, QFont, QBrush, QRadialGradient, QConicalGradient, QPainterPath
 
 AACS_DIR = Path.home() / '.config' / 'aacs'
 BDPLUS_DIR = Path.home() / '.config' / 'bdplus'
@@ -144,7 +144,7 @@ def install_missing_tools(tools, parent=None, pm=None):
         msg.setInformativeText(
             f'Install packages with {pm}?\n\n'
             f'  sudo {pm} {" ".join(pm_install)} {" ".join(pkgs)}')
-        btn_install = msg.addButton('Install', QMessageBox.ActionRole)
+        btn_install = msg.addButton('Install', QMessageBox.ButtonRole.ActionRole)
         msg.addButton('Skip', QMessageBox.RejectRole)
         msg.exec()
         if msg.clickedButton() != btn_install:
@@ -176,7 +176,7 @@ def ensure_tool(name, parent=None, pm=None):
         msg.setWindowTitle('Missing Tool')
         msg.setIcon(QMessageBox.Icon.Question)
         msg.setText(f'{name} is required for this operation.')
-        btn_install = msg.addButton('Install', QMessageBox.ActionRole)
+        btn_install = msg.addButton('Install', QMessageBox.ButtonRole.ActionRole)
         msg.addButton('Cancel', QMessageBox.RejectRole)
         msg.exec()
         if msg.clickedButton() == btn_install:
@@ -1664,16 +1664,40 @@ class DiscSpeedWidget(QWidget):
         self._anim_timer = QTimer(self)
         self._anim_timer.timeout.connect(self._tick)
         self._anim_timer.start(40)
+        self._mode = 'idle'
+        self._binary_chars = []
+        self._binary_timer = QTimer(self)
+        self._binary_timer.timeout.connect(self._add_binary_char)
+        self._binary_timer.setInterval(100)
+        self._binary_cols = 14
 
     def set_speed(self, mb_s):
         self._speed_mb_s = mb_s
 
+    def set_mode(self, mode):
+        self._mode = mode
+        if mode == 'writing':
+            self._binary_chars = []
+            self._binary_timer.start()
+        else:
+            self._binary_timer.stop()
+            self._binary_chars = []
+        self.update()
+
+    def _add_binary_char(self):
+        self._binary_chars.append(random.choice('01'))
+        max_rows = 7
+        max_chars = max_rows * self._binary_cols
+        if len(self._binary_chars) > max_chars:
+            self._binary_chars = self._binary_chars[-max_chars:]
+        self.update()
+
     def _tick(self):
         s = abs(self._speed_mb_s)
-        if s > 0.1:
+        if self._mode == 'reading' and s > 0.1:
             increment = max(0.3, min(s * 0.8, 15.0))
             self._angle = (self._angle + increment) % 360
-        else:
+        elif self._mode == 'reading' or self._mode == 'idle':
             self._angle = self._angle * 0.95
         self.update()
 
@@ -1692,23 +1716,50 @@ class DiscSpeedWidget(QWidget):
         p.setBrush(QBrush(g))
         p.drawEllipse(QPointF(cx, cy), outer, outer)
 
-        p.save()
-        p.translate(cx, cy)
-        p.rotate(self._angle)
-        cg = QConicalGradient(QPointF(0, 0), 0)
-        cg.setColorAt(0.0, QColor(255, 255, 255, 50))
-        cg.setColorAt(0.125, QColor(100, 200, 255, 40))
-        cg.setColorAt(0.25, QColor(200, 100, 255, 30))
-        cg.setColorAt(0.375, QColor(255, 200, 100, 40))
-        cg.setColorAt(0.5, QColor(100, 255, 150, 45))
-        cg.setColorAt(0.625, QColor(255, 100, 100, 35))
-        cg.setColorAt(0.75, QColor(150, 150, 255, 40))
-        cg.setColorAt(0.875, QColor(255, 255, 100, 30))
-        cg.setColorAt(1.0, QColor(255, 255, 255, 50))
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(cg))
-        p.drawEllipse(QPointF(0, 0), outer - 2, outer - 2)
-        p.restore()
+        if self._mode == 'writing':
+            p.save()
+            clip = QPainterPath()
+            clip.addEllipse(QPointF(cx, cy), outer - 2, outer - 2)
+            p.setClipPath(clip)
+            p.setFont(QFont('monospace', 6))
+            p.setPen(QColor(0, 210, 0))
+            cw, ch = 6, 10
+            start_x = int(cx - (self._binary_cols * cw / 2))
+            start_y = int(cy - 3 * ch)
+            for i, ch_ in enumerate(self._binary_chars):
+                row = i // self._binary_cols
+                col = i % self._binary_cols
+                p.drawText(start_x + col * cw, start_y + row * ch, ch_)
+            p.restore()
+            txt = f'{self._speed_mb_s:.1f} MB/s' if self._speed_mb_s > 0 else 'Writing...'
+            p.setPen(QColor(180, 200, 220))
+            p.setFont(QFont('sans-serif', 7))
+            tr = QRectF(0, h - 14, w, 14)
+            p.drawText(tr, Qt.AlignmentFlag.AlignCenter, txt)
+        elif self._mode == 'reading':
+            p.save()
+            p.translate(cx, cy)
+            p.rotate(self._angle)
+            cg = QConicalGradient(QPointF(0, 0), 0)
+            cg.setColorAt(0.0, QColor(255, 255, 255, 50))
+            cg.setColorAt(0.125, QColor(100, 200, 255, 40))
+            cg.setColorAt(0.25, QColor(200, 100, 255, 30))
+            cg.setColorAt(0.375, QColor(255, 200, 100, 40))
+            cg.setColorAt(0.5, QColor(100, 255, 150, 45))
+            cg.setColorAt(0.625, QColor(255, 100, 100, 35))
+            cg.setColorAt(0.75, QColor(150, 150, 255, 40))
+            cg.setColorAt(0.875, QColor(255, 255, 100, 30))
+            cg.setColorAt(1.0, QColor(255, 255, 255, 50))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(cg))
+            p.drawEllipse(QPointF(0, 0), outer - 2, outer - 2)
+            p.restore()
+            if self._speed_mb_s > 0:
+                txt = f'{self._speed_mb_s:.1f} MB/s'
+                p.setPen(QColor(180, 200, 220))
+                p.setFont(QFont('sans-serif', 7))
+                tr = QRectF(0, h - 14, w, 14)
+                p.drawText(tr, Qt.AlignmentFlag.AlignCenter, txt)
 
         inner = outer * 0.18
         p.setPen(QPen(QColor(120, 120, 120), 1))
@@ -1716,13 +1767,6 @@ class DiscSpeedWidget(QWidget):
         p.drawEllipse(QPointF(cx, cy), inner, inner)
         p.setBrush(QBrush(QColor(240, 240, 240)))
         p.drawEllipse(QPointF(cx, cy), inner * 0.35, inner * 0.35)
-
-        if self._speed_mb_s > 0:
-            txt = f'{self._speed_mb_s:.1f} MB/s'
-            p.setPen(QColor(180, 200, 220))
-            p.setFont(QFont('sans-serif', 8))
-            tr = QRectF(0, h - 16, w, 16)
-            p.drawText(tr, Qt.AlignmentFlag.AlignCenter, txt)
 
 
 class BluRayDumperWindow(QMainWindow):
@@ -1953,17 +1997,10 @@ class BluRayDumperWindow(QMainWindow):
         bottom_layout = QVBoxLayout(bottom_frame)
         bottom_layout.setContentsMargins(6, 1, 6, 1)
         bottom_layout.setSpacing(0)
-        self._bottom_status = QLabel('Starting...')
-        self._bottom_status.setStyleSheet('color: #555; font-size: 11px;')
-        bottom_layout.addWidget(self._bottom_status)
         self._bottom_quote = QLabel(self._pick_random_quote())
         self._bottom_quote.setStyleSheet('color: #888; font-style: italic; font-size: 11px;')
         bottom_layout.addWidget(self._bottom_quote)
         layout.addWidget(bottom_frame)
-
-        self._bottom_sync_timer = QTimer()
-        self._bottom_sync_timer.timeout.connect(self._sync_bottom_bar)
-        self._bottom_sync_timer.start(1000)
 
         self.progress_timer = QTimer()
         self.progress_timer.timeout.connect(self.update_progress)
@@ -2004,8 +2041,8 @@ class BluRayDumperWindow(QMainWindow):
                 msg.setInformativeText(
                     f'Missing: {", ".join(missing)}\n\n'
                     'Install automatically?')
-                btn_install = msg.addButton('Install', QMessageBox.ActionRole)
-                btn_manual = msg.addButton('Show Instructions', QMessageBox.ActionRole)
+                btn_install = msg.addButton('Install', QMessageBox.ButtonRole.ActionRole)
+                btn_manual = msg.addButton('Show Instructions', QMessageBox.ButtonRole.ActionRole)
                 msg.addButton('Skip', QMessageBox.RejectRole)
                 msg.exec()
 
@@ -2397,6 +2434,7 @@ class BluRayDumperWindow(QMainWindow):
             log.debug('Using keyfile: %s', keyfile)
 
         self._dump_path = dump_path
+        self._disc_widget.set_mode('reading')
         self._enter_working_state(status_text='Dumping...', log_text='Dumping disc...',
                                   start_progress_timer=True)
 
@@ -2461,6 +2499,7 @@ class BluRayDumperWindow(QMainWindow):
         self.timer.stop()
         self.progress_timer.stop()
         self.speed_label.setVisible(False)
+        self._disc_widget.set_mode('idle')
         self._disc_widget.set_speed(0)
 
         if retcode == 0:
@@ -2597,6 +2636,7 @@ class BluRayDumperWindow(QMainWindow):
                                      f'Cannot remove existing ISO: {e}')
                 return
 
+        self._disc_widget.set_mode('writing')
         self._enter_working_state(indeterminate=True, status_text='Creating ISO...',
                                   log_text='Creating ISO with UDF filesystem...',
                                   speed_text='Creating ISO...')
@@ -2616,6 +2656,7 @@ class BluRayDumperWindow(QMainWindow):
         log.info('ISO creation finished with code %d', retcode)
         self.timer.stop()
         self.speed_label.setVisible(False)
+        self._disc_widget.set_mode('idle')
         self._disc_widget.set_speed(0)
         self.progress_bar.setRange(0, 100)
         self._working = False
@@ -2904,6 +2945,7 @@ class BluRayDumperWindow(QMainWindow):
         out_name = sanitize_filename(self._dump_path.name) + '_compressed.mkv'
         out_path = self._dump_path.parent / out_name
 
+        self._disc_widget.set_mode('writing')
         self._enter_working_state(indeterminate=False, status_text='Compressing...',
                                   log_text='Compressing main movie...',
                                   show_speed=True)
@@ -2925,6 +2967,7 @@ class BluRayDumperWindow(QMainWindow):
             return
         out_name = sanitize_filename(self._dump_path.name) + '.mkv'
         out_path = self._dump_path.parent / out_name
+        self._disc_widget.set_mode('writing')
         self._enter_working_state(indeterminate=False, status_text='Remuxing to MKV...',
                                   log_text='Remuxing main movie (direct copy, no re-encode)...',
                                   show_speed=True)
@@ -3198,6 +3241,7 @@ class BluRayDumperWindow(QMainWindow):
             self.eject_disc()
         self._pending_auto_delete = False
         self._pending_auto_eject = False
+        self._disc_widget.set_mode('idle')
         self._disc_widget.set_speed(0)
 
     def on_compress_finished(self, retcode, error):
@@ -3356,20 +3400,53 @@ class BluRayDumperWindow(QMainWindow):
 
     @staticmethod
     def _run_subprocess_streaming(cmd, timeout=3600, label='process'):
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        if result.returncode != 0:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, bufsize=1)
+        out_lines = []
+        err_lines = []
+
+        def _reader(pipe, store):
+            try:
+                for line in iter(pipe.readline, ''):
+                    store.append(line)
+            except ValueError:
+                pass
+            finally:
+                pipe.close()
+
+        out_t = threading.Thread(target=_reader, args=(proc.stdout, out_lines), daemon=True)
+        err_t = threading.Thread(target=_reader, args=(proc.stderr, err_lines), daemon=True)
+        out_t.start()
+        err_t.start()
+
+        elapsed = 0.0
+        poll = 0.05
+        while proc.poll() is None:
+            time.sleep(poll)
+            elapsed += poll
+            QApplication.processEvents()
+            if timeout and elapsed > timeout:
+                proc.kill()
+                proc.wait(2)
+                out_t.join(1)
+                err_t.join(1)
+                raise subprocess.TimeoutExpired(cmd, timeout)
+
+        out_t.join(2)
+        err_t.join(2)
+        out = ''.join(out_lines)
+        err = ''.join(err_lines)
+        rc = proc.returncode
+        if rc != 0:
             log.error('%s failed (code=%d): stdout=%s, stderr=%s',
-                      label, result.returncode,
-                      result.stdout[-500:] if result.stdout else '',
-                      result.stderr[-500:] if result.stderr else '')
+                      label, rc, out[-500:] if out else '', err[-500:] if err else '')
         else:
             log.debug('%s succeeded (code=0): stdout=%s, stderr=%s',
-                      label,
-                      result.stdout[-200:] if result.stdout else '',
-                      result.stderr[-200:] if result.stderr else '')
-        return result.returncode, result.stdout, result.stderr
+                      label, out[-200:] if out else '', err[-200:] if err else '')
+        return rc, out, err
 
     def _create_avchd_iso(self, mkv_path):
+        self._disc_widget.set_mode('writing')
         self.status_label.setText('Creating AVCHD DVD...')
         self.log_output.setText('Remuxing with ffmpeg...')
         QApplication.processEvents()
@@ -3533,6 +3610,7 @@ class BluRayDumperWindow(QMainWindow):
         return 'ntsc'
 
     def _create_dvd_video_iso(self, mkv_path):
+        self._disc_widget.set_mode('writing')
         self.status_label.setText('Creating DVD-Video...')
         self.log_output.setText('Encoding to DVD-compatible MPEG-2...')
         QApplication.processEvents()
@@ -3650,8 +3728,8 @@ class BluRayDumperWindow(QMainWindow):
         msg.setIcon(QMessageBox.Icon.Question)
         msg.setText(f'ISO ready:\n{iso_path.name}')
         msg.setInformativeText('How would you like to burn this disc?')
-        btn_k3b = msg.addButton('Open in K3B', QMessageBox.ActionRole)
-        btn_wodim = msg.addButton('Burn with wodim', QMessageBox.ActionRole)
+        btn_k3b = msg.addButton('Open in K3B', QMessageBox.ButtonRole.ActionRole)
+        btn_wodim = msg.addButton('Burn with wodim', QMessageBox.ButtonRole.ActionRole)
         btn_skip = msg.addButton('Skip', QMessageBox.RejectRole)
         msg.setDefaultButton(btn_skip)
         msg.exec()
@@ -3666,6 +3744,8 @@ class BluRayDumperWindow(QMainWindow):
             self._run_wodim_burn(iso_path)
 
     def _run_wodim_burn(self, iso_path):
+        self._disc_widget.set_mode('writing')
+        self._disc_widget.set_speed(0)
         self.status_label.setText('Burning DVD...')
         self.log_output.setText(f'Burning {iso_path.name} with wodim...')
         dev = QInputDialog.getText(self, 'Disc Device',
@@ -3680,6 +3760,8 @@ class BluRayDumperWindow(QMainWindow):
         burner.start()
 
     def _on_burn_finished(self, ok, iso_path):
+        self._disc_widget.set_mode('idle')
+        self._disc_widget.set_speed(0)
         if ok:
             QMessageBox.information(
                 self, 'Burn Complete',
@@ -3724,6 +3806,7 @@ class BluRayDumperWindow(QMainWindow):
             extract_dir = self._dump_path.parent / (
                 sanitize_filename(self._dump_path.name) + '_extracted')
             extract_dir.mkdir(parents=True, exist_ok=True)
+            self._disc_widget.set_mode('writing')
             self._enter_working_state(show_progress=False, show_timer=False,
                                       show_speed=False,
                                       status_text='Extracting...',
@@ -3737,6 +3820,8 @@ class BluRayDumperWindow(QMainWindow):
     def on_extract_finished(self, retcode, error):
         if self._cancelled:
             return
+        self._disc_widget.set_mode('idle')
+        self._disc_widget.set_speed(0)
         self._working = False
         self.reset_buttons()
         if retcode == 0:
@@ -3774,16 +3859,7 @@ class BluRayDumperWindow(QMainWindow):
             log.warning('Catalog insert failed: %s', e)
 
     def _pick_random_quote(self):
-        import random
         return random.choice(IMG_QUOTES)
-
-    def _sync_bottom_bar(self):
-        dev = self.device_path if hasattr(self, 'device_path') else ''
-        label = ''
-        if hasattr(self, 'disc_label') and self.disc_label:
-            label = f'  |  {self.disc_label}'
-        self._bottom_status.setText(f'{dev}{label}' if dev else 'No drive')
-
 
 def global_exception_handler(exc_type, exc_value, exc_tb):
     log.critical('Unhandled exception',
