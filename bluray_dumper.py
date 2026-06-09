@@ -29,6 +29,46 @@ TOOL_INSTALL = {
                     '   dnf install genisoimage    # Fedora',
     'blockdev':     '   pacman -S util-linux       # Arch\n'
                     '   apt install util-linux     # Debian/Ubuntu',
+    'mkudffs':      '   pacman -S udftools          # Arch\n'
+                    '   apt install udftools        # Debian/Ubuntu',
+}
+TOOL_PACKAGES = {
+    'pacman': {
+        'bluraybackup': 'bluraybackup',
+        'genisoimage': 'cdrtools',
+        'blockdev': 'util-linux',
+        'mkudffs': 'udftools',
+        'HandBrakeCLI': 'handbrake-cli',
+        'ffmpeg': 'ffmpeg',
+        'blkid': 'util-linux',
+        'isoinfo': 'cdrtools',
+        'git': 'git',
+        'dvdauthor': 'dvdauthor',
+    },
+    'apt': {
+        'bluraybackup': 'bluraybackup',
+        'genisoimage': 'genisoimage',
+        'blockdev': 'util-linux',
+        'mkudffs': 'udftools',
+        'HandBrakeCLI': 'handbrake-cli',
+        'ffmpeg': 'ffmpeg',
+        'blkid': 'util-linux',
+        'isoinfo': 'genisoimage',
+        'git': 'git',
+        'dvdauthor': 'dvdauthor',
+    },
+    'dnf': {
+        'bluraybackup': 'bluraybackup',
+        'genisoimage': 'genisoimage',
+        'blockdev': 'util-linux',
+        'mkudffs': 'udftools',
+        'HandBrakeCLI': 'HandBrakeCLI',
+        'ffmpeg': 'ffmpeg',
+        'blkid': 'util-linux',
+        'isoinfo': 'genisoimage',
+        'git': 'git',
+        'dvdauthor': 'dvdauthor',
+    },
 }
 
 TARGET_SIZES = {
@@ -67,6 +107,82 @@ def check_required_tools():
         return missing
     log.debug('All required tools found')
     return []
+
+
+def detect_pm():
+    for pm in ['pacman', 'apt', 'dnf']:
+        if shutil.which(pm):
+            return pm
+    return None
+
+
+def install_missing_tools(tools, parent=None, pm=None):
+    if pm is None:
+        pm = detect_pm()
+    if pm is None:
+        return False
+    if not shutil.which('pkexec'):
+        log.error('pkexec not found, cannot auto-install')
+        return False
+
+    pkgs = [TOOL_PACKAGES.get(pm, {}).get(t, t) for t in tools]
+    pkgs = [p for p in pkgs if p]
+    if not pkgs:
+        return False
+
+    pm_install = {
+        'pacman': ['-S', '--noconfirm'],
+        'apt': ['install', '-y'],
+        'dnf': ['install', '-y'],
+    }.get(pm, [])
+
+    if parent:
+        msg = QMessageBox(parent)
+        msg.setWindowTitle('Install Missing Tools')
+        msg.setIcon(QMessageBox.Question)
+        msg.setText(f'The following tools are required:\n{", ".join(tools)}')
+        msg.setInformativeText(
+            f'Install packages with {pm}?\n\n'
+            f'  sudo {pm} {" ".join(pm_install)} {" ".join(pkgs)}')
+        btn_install = msg.addButton('Install', QMessageBox.ActionRole)
+        msg.addButton('Skip', QMessageBox.RejectRole)
+        msg.exec()
+        if msg.clickedButton() != btn_install:
+            return False
+
+    cmd = ['pkexec', pm] + pm_install + pkgs
+    log.info('Installing: %s', ' '.join(cmd))
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if r.returncode == 0:
+            log.info('Installation successful')
+            return True
+        log.error('Installation failed (code %d): %s', r.returncode, r.stderr[-300:])
+    except subprocess.TimeoutExpired:
+        log.error('Installation timed out')
+    except Exception as e:
+        log.error('Install exception: %s', e)
+    return False
+
+
+def ensure_tool(name, parent=None, pm=None):
+    if tool_available(name):
+        return True
+    log.warning('Tool missing: %s', name)
+    if pm is None:
+        pm = detect_pm()
+    if pm and shutil.which('pkexec') and parent:
+        msg = QMessageBox(parent)
+        msg.setWindowTitle('Missing Tool')
+        msg.setIcon(QMessageBox.Question)
+        msg.setText(f'{name} is required for this operation.')
+        btn_install = msg.addButton('Install', QMessageBox.ActionRole)
+        msg.addButton('Cancel', QMessageBox.RejectRole)
+        msg.exec()
+        if msg.clickedButton() == btn_install:
+            if install_missing_tools([name], parent=parent, pm=pm):
+                return tool_available(name)
+    return False
 
 
 def readable_device(device):
@@ -313,7 +429,6 @@ def _write_movieobject_bdmv(path):
 
 def _write_playlist(path, duration_sec, has_audio=True):
     total_ticks = int(duration_sec * 45000)
-    stn_length = 0
     stn_buf = bytearray()
     stn_buf += struct.pack('>H', 1 if has_audio else 0)
     stn_buf += b'\x00' * 2
@@ -822,7 +937,12 @@ class CompressWorker(QThread):
             return
         main_movie = max(m2ts_files, key=lambda f: f.stat().st_size)
 
-        if tool_available('HandBrakeCLI'):
+        gpu_encoder, _ = self._detect_gpu_encoder()
+
+        if gpu_encoder:
+            log.info('GPU encoder detected (%s), using ffmpeg with hardware acceleration', gpu_encoder)
+            self._ffmpeg_encode(main_movie)
+        elif tool_available('HandBrakeCLI'):
             cmd = self._build_handbrake_cmd(main_movie)
             log.info('Starting compression (HandBrakeCLI): %s', ' '.join(cmd))
             try:
@@ -1121,6 +1241,47 @@ class ExtractWorker(QThread):
                 self._process.kill()
 
 
+class BurnWorker(QThread):
+    finished = pyqtSignal(bool, object)
+
+    def __init__(self, parent, iso_path, device):
+        super().__init__(parent)
+        self.iso_path = iso_path
+        self.device = device
+        self._process = None
+
+    def run(self):
+        try:
+            cmd = ['pkexec', 'wodim', '-v', '-dao',
+                   f'dev={self.device}', 'speed=4',
+                   str(self.iso_path)]
+            self._process = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True)
+            for line in self._process.stdout:
+                log.info('[wodim] %s', line.rstrip())
+            self._process.wait()
+            if self._process.returncode == 0:
+                self.finished.emit(True, self.iso_path)
+            else:
+                log.error('wodim failed with code %d', self._process.returncode)
+                self.finished.emit(False, self.iso_path)
+        except Exception as e:
+            log.error('Burn worker exception: %s', traceback.format_exc())
+            _write_crash_dump('BurnWorker', sys.exc_info())
+            self.finished.emit(False, self.iso_path)
+
+    def stop(self):
+        if self._process and self._process.poll() is None:
+            self._process.terminate()
+            try:
+                self._process.wait(3)
+            except subprocess.TimeoutExpired:
+                pass
+            if self._process.poll() is None:
+                self._process.kill()
+
+
 def list_streams(m2ts_path):
     try:
         r = subprocess.run(['ffprobe', '-v', 'quiet',
@@ -1308,6 +1469,12 @@ class IsoBrowserDialog(QDialog):
             'padding: 6px; border-radius: 4px; }')
         extract_btn.clicked.connect(self.extract_files)
         extract_row.addWidget(extract_btn)
+        burn_btn = QPushButton('Burn ISO')
+        burn_btn.setStyleSheet(
+            'QPushButton { background-color: #d9804a; color: white; font-weight: bold; '
+            'padding: 6px; border-radius: 4px; }')
+        burn_btn.clicked.connect(self.burn_iso)
+        extract_row.addWidget(burn_btn)
         layout.addLayout(extract_row)
 
         self.iso_path = None
@@ -1389,6 +1556,16 @@ class IsoBrowserDialog(QDialog):
                     log.warning('Failed to extract %s: %s', iso_path, r.stderr)
         except Exception as e:
             log.error('Extraction failed for %s: %s', iso_path, e)
+
+    def burn_iso(self):
+        iso = self.iso_path
+        if not iso or not Path(iso).is_file():
+            QMessageBox.warning(self, 'Error', 'Select a valid ISO file first.')
+            return
+        self.accept()
+        parent = self.parent()
+        if parent and hasattr(parent, '_burn_iso_dialog'):
+            parent._burn_iso_dialog(Path(iso))
 
 
 class ProfileManager:
@@ -1653,15 +1830,53 @@ class BluRayDumperWindow(QMainWindow):
         missing = check_required_tools()
         if missing:
             self.status_label.setText('Setup incomplete')
-            install_guide = '\n'.join(
-                f'{t}:\n{TOOL_INSTALL.get(t, t)}' for t in missing)
+            self.refresh_btn.setEnabled(False)
+            self.select_dest_btn.setEnabled(False)
+            log.error('Missing required tools: %s', ', '.join(missing))
+
+            pm = detect_pm()
+            if pm and shutil.which('pkexec'):
+                msg = QMessageBox(self)
+                msg.setWindowTitle('Install Missing Tools')
+                msg.setIcon(QMessageBox.Question)
+                msg.setText('Required tools are missing.')
+                msg.setInformativeText(
+                    f'Missing: {", ".join(missing)}\n\n'
+                    'Install automatically?')
+                btn_install = msg.addButton('Install', QMessageBox.ActionRole)
+                btn_manual = msg.addButton('Show Instructions', QMessageBox.ActionRole)
+                msg.addButton('Skip', QMessageBox.RejectRole)
+                msg.exec()
+
+                if msg.clickedButton() == btn_install:
+                    if install_missing_tools(missing, parent=self, pm=pm):
+                        self.status_label.setText('Tools installed')
+                        self.disc_info.setText('Tools installed. Refreshing...')
+                        QApplication.processEvents()
+                        if not check_required_tools():
+                            self.refresh_btn.setEnabled(True)
+                            self.select_dest_btn.setEnabled(True)
+                            self.check_disc()
+                            return
+                        else:
+                            QMessageBox.warning(self, 'Installation Issue',
+                                'Some tools may still be missing.\n'
+                                'Please check the log and install manually.')
+                elif msg.clickedButton() == btn_manual:
+                    install_guide = '\n'.join(
+                        f'{t}:\n{TOOL_INSTALL.get(t, t)}' for t in missing)
+                    QMessageBox.information(self, 'Manual Install',
+                        f'Install missing tools:\n\n{install_guide}')
+                    self.disc_info.setText(
+                        f'Missing tools: {", ".join(missing)}\n\n'
+                        'Install with your package manager:\n\n'
+                        f'{install_guide}')
+                    return
+
             self.disc_info.setText(
                 f'Missing tools: {", ".join(missing)}\n\n'
                 'Install with your package manager:\n\n'
-                f'{install_guide}')
-            self.refresh_btn.setEnabled(False)
-            self.select_dest_btn.setEnabled(False)
-            log.error('Missing required tools:\n%s', install_guide)
+                + '\n'.join(f'{t}:\n{TOOL_INSTALL.get(t, t)}' for t in missing))
         else:
             self.check_disc()
 
@@ -1933,7 +2148,7 @@ class BluRayDumperWindow(QMainWindow):
         if not self.dest_dir or not self.disc_label:
             return
 
-        if not tool_available('bluraybackup'):
+        if not ensure_tool('bluraybackup', parent=self):
             QMessageBox.critical(self, 'Missing Tool',
                                  'bluraybackup is not installed.\n\n'
                                  f'Install:\n{TOOL_INSTALL["bluraybackup"]}')
@@ -2170,7 +2385,7 @@ class BluRayDumperWindow(QMainWindow):
                                  'Dump folder not found. Cannot create ISO.')
             return
 
-        if not tool_available('genisoimage'):
+        if not ensure_tool('genisoimage', parent=self):
             QMessageBox.critical(self, 'Missing Tool',
                                  'genisoimage is not installed.\n\n'
                                  f'Install:\n{TOOL_INSTALL["genisoimage"]}')
@@ -2745,7 +2960,7 @@ class BluRayDumperWindow(QMainWindow):
             target_bytes = dialog.get_target_bytes()
             if not folders or target_bytes <= 0:
                 return
-            if not tool_available('HandBrakeCLI'):
+            if not ensure_tool('HandBrakeCLI', parent=self):
                 QMessageBox.critical(self, 'Missing Tool',
                                      'HandBrakeCLI is not installed.')
                 return
@@ -2916,16 +3131,6 @@ class BluRayDumperWindow(QMainWindow):
             return False
 
     @staticmethod
-    def _udf_revision_supported():
-        try:
-            r = subprocess.run(
-                ['genisoimage', '-udf-revision', '0x0200'],
-                capture_output=True, text=True, timeout=10)
-            return r.returncode == 0
-        except Exception:
-            return False
-
-    @staticmethod
     def _run_subprocess_streaming(cmd, timeout=3600, label='process'):
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         if result.returncode != 0:
@@ -3035,33 +3240,81 @@ class BluRayDumperWindow(QMainWindow):
         (cert_dir / 'id.bdmv').write_bytes(bytes(id_data))
 
         vol_id = name_stem.replace('_', ' ')[:32].upper().strip() or 'AVCHD'
-        self.log_output.setText('Creating AVCHD ISO...')
+        self.log_output.setText('Creating AVCHD ISO (UDF 2.50)...')
         QApplication.processEvents()
 
-        iso_cmd = ['genisoimage', '-iso-level', '4', '-udf']
-        if self._udf_revision_supported():
-            iso_cmd += ['-udf-revision', '0x0200']
-        iso_cmd += ['-V', vol_id, '-volset', vol_id,
-                    '-o', str(iso_path), str(avchd_dir)]
+        if not ensure_tool('mkudffs', parent=self):
+            QMessageBox.critical(self, 'Missing Tool',
+                'mkudffs (from udftools) is required for AVCHD ISO.\n'
+                f'{TOOL_INSTALL["mkudffs"]}')
+            shutil.rmtree(avchd_dir, ignore_errors=True)
+            return
 
-        rc, out, err = self._run_subprocess_streaming(iso_cmd, label='genisoimage_avchd')
+        total_size = sum(f.stat().st_size for f in avchd_dir.rglob('*') if f.is_file()) + 10 * 1024 * 1024
+        blocks = (total_size + 2047) // 2048
+
+        rc, out, err = self._run_subprocess_streaming(
+            ['mkudffs', '--media-type', 'hd', '--udfrev', '2.01',
+             '--label', vol_id, '--blocksize', '2048',
+             str(iso_path), str(blocks)],
+            label='mkudffs')
         if rc != 0:
             err_msg = (err[-500:] if err else 'unknown error').strip()
             self.status_label.setText('AVCHD ISO failed')
             self.log_output.setText(err_msg)
             QMessageBox.critical(self, 'AVCHD Error',
-                f'ISO creation failed (code {rc}):\n{err_msg}')
+                f'UDF filesystem creation failed (code {rc}):\n{err_msg}')
             shutil.rmtree(avchd_dir, ignore_errors=True)
             return
+
+        iso_path.chmod(0o666)
+        self.log_output.setText('Populating ISO with AVCHD structure...')
+        QApplication.processEvents()
+
+        import tempfile
+        script_fd, script_path = tempfile.mkstemp(
+            suffix='.sh', prefix='avchd_populate_')
+        os.close(script_fd)
+        try:
+            script_lines = [
+                '#!/bin/sh',
+                'set -e',
+                f'ISO="{iso_path}"',
+                f'SRC="{avchd_dir}"',
+                'if mountpoint -q /mnt; then',
+                '  echo "ERROR: /mnt is already mounted" >&2',
+                '  exit 1',
+                'fi',
+                'LOOP=$(losetup -f --show "$ISO")',
+                'mount -o rw "$LOOP" /mnt',
+                'cp -a "$SRC/BDMV" /mnt/',
+                'cp -a "$SRC/CERTIFICATE" /mnt/',
+                'sync',
+                'umount /mnt',
+                'losetup -d "$LOOP"',
+            ]
+            with open(script_path, 'w') as f:
+                f.write('\n'.join(script_lines) + '\n')
+            os.chmod(script_path, 0o755)
+
+            rc2, out2, err2 = self._run_subprocess_streaming(
+                ['pkexec', script_path], label='isopopulate')
+            if rc2 != 0:
+                err_msg = (err2[-500:] if err2 else 'populate failed').strip()
+                self.status_label.setText('AVCHD ISO failed')
+                self.log_output.setText(err_msg)
+                QMessageBox.critical(self, 'AVCHD Error',
+                    f'Failed to populate ISO (code {rc2}):\n{err_msg}')
+                shutil.rmtree(avchd_dir, ignore_errors=True)
+                return
+        finally:
+            if script_path and os.path.exists(script_path):
+                os.unlink(script_path)
 
         shutil.rmtree(avchd_dir, ignore_errors=True)
         self.status_label.setText('AVCHD DVD ISO created')
         self.log_output.setText(f'Created: {iso_path.name}')
-        QMessageBox.information(
-            self, 'AVCHD Complete',
-            f'AVCHD DVD ISO created:\n{iso_path}\n\n'
-            f'Burn to a DVD-R/RW disc with:\n'
-            f'  sudo wodim -v -dao dev=/dev/sr0 {iso_path.name}')
+        self._burn_iso_dialog(iso_path)
         log.info('AVCHD ISO created: %s', iso_path)
 
     @staticmethod
@@ -3186,12 +3439,55 @@ class BluRayDumperWindow(QMainWindow):
         shutil.rmtree(dvd_dir, ignore_errors=True)
         self.status_label.setText('DVD-Video ISO created')
         self.log_output.setText(f'Created: {iso_path.name}')
-        QMessageBox.information(
-            self, 'DVD-Video Complete',
-            f'DVD-Video ISO created:\n{iso_path}\n\n'
-            f'Burn to a DVD-R/RW disc with:\n'
-            f'  sudo wodim -v -dao dev=/dev/sr0 {iso_path.name}')
+        self._burn_iso_dialog(iso_path)
         log.info('DVD-Video ISO created: %s', iso_path)
+
+    def _burn_iso_dialog(self, iso_path):
+        msg = QMessageBox(self)
+        msg.setWindowTitle('Burn DVD')
+        msg.setIcon(QMessageBox.Question)
+        msg.setText(f'ISO ready:\n{iso_path.name}')
+        msg.setInformativeText('How would you like to burn this disc?')
+        btn_k3b = msg.addButton('Open in K3B', QMessageBox.ActionRole)
+        btn_wodim = msg.addButton('Burn with wodim', QMessageBox.ActionRole)
+        btn_skip = msg.addButton('Skip', QMessageBox.RejectRole)
+        msg.setDefaultButton(btn_skip)
+        msg.exec()
+
+        if msg.clickedButton() == btn_k3b:
+            subprocess.Popen(['k3b', '--image', str(iso_path)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            QMessageBox.information(self, 'K3B Launched',
+                                    'K3B has been opened with the ISO loaded.\n'
+                                    'Review settings and click Burn.')
+        elif msg.clickedButton() == btn_wodim:
+            self._run_wodim_burn(iso_path)
+
+    def _run_wodim_burn(self, iso_path):
+        self.status_label.setText('Burning DVD...')
+        self.log_output.setText(f'Burning {iso_path.name} with wodim...')
+        dev = QInputDialog.getText(self, 'Disc Device',
+                                   'Enter DVD burner device:',
+                                   text='/dev/sr0')
+        if not dev[1] or not dev[0].strip():
+            return
+        device = dev[0].strip()
+        burner = BurnWorker(self, iso_path, device)
+        burner.finished.connect(
+            lambda ok, path: self._on_burn_finished(ok, path))
+        burner.start()
+
+    def _on_burn_finished(self, ok, iso_path):
+        if ok:
+            QMessageBox.information(
+                self, 'Burn Complete',
+                f'ISO burned successfully:\n{iso_path}\n\n'
+                'Verify playback on your set-top player.')
+        else:
+            QMessageBox.critical(
+                self, 'Burn Failed',
+                f'Failed to burn:\n{iso_path}\n\n'
+                f'Check the log for details.')
 
     def open_extraction(self):
         if self._working:
@@ -3306,8 +3602,9 @@ def log_system_info():
     log.info('CPU: %s', platform.processor() or 'unknown')
     log.info('Memory: %s', platform.machine())
     for prog, ver_flag in [('ffmpeg', '-version'), ('HandBrakeCLI', '--version'),
-                           ('bluraybackup', '--version'), ('genisoimage', '--version'),
-                           ('blockdev', '--version'), ('eject', '--version')]:
+                            ('bluraybackup', '--version'), ('genisoimage', '--version'),
+                            ('blockdev', '--version'), ('eject', '--version'),
+                            ('mkudffs', '--version'), ('wodim', '--version')]:
         try:
             r = subprocess.run([prog, ver_flag], capture_output=True, text=True, timeout=5)
             first = (r.stdout or r.stderr or '').split('\n')[0][:120]
