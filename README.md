@@ -1,5 +1,3 @@
-<img width="499" height="500" alt="Screenshot_20260609_081142" src="https://github.com/user-attachments/assets/01d6ecfd-e7cc-41cb-a6b1-afa5c3968518" />
-
 # bluray-dumper
 
 PyQt6 GUI for dumping Blu-ray discs, creating UDF ISOs, compressing/remuxing to MKV, authoring AVCHD/DVD-Video ISOs, and burning.
@@ -66,12 +64,13 @@ Place AACS keys at `~/.config/aacs/KEYDB.cfg` and BD+ data at `~/.config/bdplus/
 
 ## Features
 
-- **Disc dump** via bluraybackup with live progress, speed (GB/h, MB/s), and ETA
+- **Disc dump** via bluraybackup with live progress, speed (GB/h, MB/s), and ETA (same progress/ETA display also shown during compress and remux)
 - **UDF ISO** creation with genisoimage and SHA256 checksum verification
 - **Compression** with HandBrakeCLI or ffmpeg GPU (VAAPI/AMF/NVENC/QSV) — auto-detected
-- **ffmpeg fallback** — if HandBrakeCLI exits 0 with no output, ffmpeg is used automatically
+- **ffmpeg fallback** — if HandBrakeCLI exits 0 with no output, ffmpeg is used automatically (GPU or CPU)
+- **English audio auto-select** — ffprobe finds first audio stream tagged `eng`, no fragile `m:language` syntax
 - **Direct-to-MKV (remux)** — `ffmpeg -c copy`, no re-encode, no ISO
-- **AVCHD ISO** — remux MKV → M2TS → BDMV structure → mkudffs UDF 2.50 ISO
+- **AVCHD ISO** — remux MKV → M2TS (`-mpegts_m2ts_mode 1`) → manual BDMV structure → mkudffs UDF 2.50 ISO (temp mount point, no `/mnt` collision)
 - **DVD-Video ISO** — ffmpeg MPEG-2 encode → dvdauthor → genisoimage UDF ISO
 - **GPU encode** — auto-detects h264_vaapi, h264_amf, h264_nvenc, h264_qsv in priority order
 - **Burn ISO** — after creation or from ISO browser: "Open in K3B" or "Burn with wodim" (pkexec)
@@ -88,6 +87,7 @@ Place AACS keys at `~/.config/aacs/KEYDB.cfg` and BD+ data at `~/.config/bdplus/
 - **Settings** — persistent device, destination, auto-eject, auto-delete, compression target
 - **Clear & Reset** — one-click clear log and reset UI
 - **Crash protection** — `faulthandler`, thread/sys excepthooks, crash dump to `~/bluray_dumper_crash.log`
+- **In-app Disclaimer** — READ menu bar with legal disclaimer
 
 ## Workflow
 
