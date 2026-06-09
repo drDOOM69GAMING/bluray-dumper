@@ -1,3 +1,5 @@
+<img width="1222" height="1318" alt="Screenshot_20260609_123321" src="https://github.com/user-attachments/assets/e13ba908-921f-4e21-a7b3-81a5a3f801b5" />
+
 # bluray-dumper
 
 PyQt6 GUI for dumping Blu-ray discs, creating UDF ISOs, compressing/remuxing to MKV, authoring AVCHD/DVD-Video ISOs, and burning.
@@ -65,6 +67,9 @@ Place AACS keys at `~/.config/aacs/KEYDB.cfg` and BD+ data at `~/.config/bdplus/
 ## Features
 
 - **Disc dump** via bluraybackup with live progress, speed (GB/h, MB/s), and ETA (same progress/ETA display also shown during compress and remux)
+- **Disc speed widget** — upper-right spinning disc animation with real-time MB/s readout; rotation speed matches drive/encode speed
+- **ImgBurn-style quotes** — random witty quote displayed in the bottom status bar on every launch
+- **Bottom status bar** — shows device path + disc label on one line, random quote on the next, styled like ImgBurn's status bar
 - **UDF ISO** creation with genisoimage and SHA256 checksum verification
 - **Compression** with HandBrakeCLI or ffmpeg GPU (VAAPI/AMF/NVENC/QSV) — auto-detected
 - **ffmpeg fallback** — if HandBrakeCLI exits 0 with no output, ffmpeg is used automatically (GPU or CPU)
@@ -74,6 +79,7 @@ Place AACS keys at `~/.config/aacs/KEYDB.cfg` and BD+ data at `~/.config/bdplus/
 - **DVD-Video ISO** — ffmpeg MPEG-2 encode → dvdauthor → genisoimage UDF ISO
 - **GPU encode** — auto-detects h264_vaapi, h264_amf, h264_nvenc, h264_qsv in priority order
 - **Burn ISO** — after creation or from ISO browser: "Open in K3B" or "Burn with wodim" (pkexec)
+- **Post-burn cleanup dialog** — asks whether to delete temporary files after ISO creation
 - **ISO browser & restore** — list and extract files from ISOs; re-burn any ISO
 - **Auto-install** — missing tools installed via `pkexec <pm> -S <pkgs>` with confirmation dialog
 - **Batch compression queue** — process multiple existing dumps
@@ -105,5 +111,3 @@ All operations logged to `~/bluray_dumper.log`. Crash dumps written to `~/bluray
 
 - **AVCHD ISO** (mkudffs, UDF 2.50): works on PS3, PS4, most standalone Blu-ray players
 - **DVD-Video ISO**: universal DVD player compatibility
-  
-<img width="1228" height="1815" alt="Screenshot_20260609_104339-1" src="https://github.com/user-attachments/assets/662e5607-6c81-4ed6-bb3a-410d229aba68" />
