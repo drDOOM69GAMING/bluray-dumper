@@ -1,4 +1,4 @@
-<img width="860" height="863" alt="Screenshot_20260609_081142" src="https://github.com/user-attachments/assets/e672e7c2-5a36-41ef-b44b-8b4fa58206b3" />
+<img width="499" height="500" alt="Screenshot_20260609_081142" src="https://github.com/user-attachments/assets/01d6ecfd-e7cc-41cb-a6b1-afa5c3968518" />
 
 # bluray-dumper
 
