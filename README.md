@@ -105,3 +105,5 @@ All operations logged to `~/bluray_dumper.log`. Crash dumps written to `~/bluray
 
 - **AVCHD ISO** (mkudffs, UDF 2.50): works on PS3, PS4, most standalone Blu-ray players
 - **DVD-Video ISO**: universal DVD player compatibility
+  
+<img width="1228" height="1815" alt="Screenshot_20260609_104339-1" src="https://github.com/user-attachments/assets/662e5607-6c81-4ed6-bb3a-410d229aba68" />
