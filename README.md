@@ -1,3 +1,4 @@
+
 # bluray-dumper
 
 PyQt6 GUI for dumping Blu-ray discs, creating UDF ISOs, compressing/remuxing to MKV, authoring AVCHD/DVD-Video ISOs, and burning.
@@ -117,3 +118,5 @@ All operations logged to `~/bluray_dumper.log`. Crash dumps written to `~/bluray
 - **MKV**: universal software playback (no disc needed)
 
 For widest disc player compatibility, choose DVD-Video over AVCHD.
+
+<img width="1401" height="1315" alt="Screenshot_20260610_105732-1" src="https://github.com/user-attachments/assets/339c96de-1cc1-40f3-a773-d8b3f623c89d" />
