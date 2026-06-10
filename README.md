@@ -1,4 +1,4 @@
-<img width="1222" height="1318" alt="Screenshot_20260609_123321" src="https://github.com/user-attachments/assets/e13ba908-921f-4e21-a7b3-81a5a3f801b5" />
+<img width="1217" height="1312" alt="Screenshot_20260609_205305-1" src="https://github.com/user-attachments/assets/86313b41-a56b-42ba-9a37-f1c9bbe1511b" />
 
 # bluray-dumper
 
@@ -67,41 +67,45 @@ Place AACS keys at `~/.config/aacs/KEYDB.cfg` and BD+ data at `~/.config/bdplus/
 ## Features
 
 - **Disc dump** via bluraybackup with live progress, speed (GB/h, MB/s), and ETA (same progress/ETA display also shown during compress and remux)
-- **Disc speed widget** — upper-right spinning disc animation with real-time MB/s readout; rotation speed matches drive/encode speed
-- **ImgBurn-style quotes** — random witty quote displayed in the bottom status bar on every launch
-- **Bottom status bar** — shows device path + disc label on one line, random quote on the next, styled like ImgBurn's status bar
+- **Disc speed widget** — upper-right: spinning disc during reads, fire-colored binary chars (`010101`) during writes (red→orange→yellow gradient)
+- **ImgBurn-style quotes** — random quote in the bottom status bar
 - **UDF ISO** creation with genisoimage and SHA256 checksum verification
 - **Compression** with HandBrakeCLI or ffmpeg GPU (VAAPI/AMF/NVENC/QSV) — auto-detected
 - **ffmpeg fallback** — if HandBrakeCLI exits 0 with no output, ffmpeg is used automatically (GPU or CPU)
-- **English audio auto-select** — ffprobe finds first audio stream tagged `eng`, no fragile `m:language` syntax
+- **English audio auto-select** — ffprobe finds first audio stream tagged `eng`
 - **Direct-to-MKV (remux)** — `ffmpeg -c copy`, no re-encode, no ISO
-- **AVCHD ISO** — remux MKV → M2TS (`-mpegts_m2ts_mode 1`) → manual BDMV structure → mkudffs UDF 2.50 ISO (temp mount point, no `/mnt` collision)
+- **AVCHD ISO** — remux MKV → M2TS → BDMV structure → mkudffs UDF 2.50 ISO (verified after population)
 - **DVD-Video ISO** — ffmpeg MPEG-2 encode → dvdauthor → genisoimage UDF ISO
-- **GPU encode** — auto-detects h264_vaapi, h264_amf, h264_nvenc, h264_qsv in priority order
-- **Burn ISO** — after creation or from ISO browser: "Open in K3B" or "Burn with wodim" (pkexec)
-- **Post-burn cleanup dialog** — asks whether to delete temporary files after ISO creation
-- **ISO browser & restore** — list and extract files from ISOs; re-burn any ISO
-- **Auto-install** — missing tools installed via `pkexec <pm> -S <pkgs>` with confirmation dialog
-- **Batch compression queue** — process multiple existing dumps
-- **Audio/subtitle extraction** via ffprobe/ffmpeg stream selection dialog
-- **Disc catalog** — SQLite database tracking all dumps (label, sizes, SHA256, compression)
-- **Config profiles** — save/load named profiles with device, destination, compression settings
-- **Batch queue** — sequential disc processing with per-entry MKV flag
+- **GPU encode** — auto-detects h264_vaapi, h264_amf, h264_nvenc, h264_qsv
+- **Burn ISO** — "Open in K3B" or "Burn with wodim" (pkexec); auto-eject after burn
+- **Post-burn cleanup dialog** — delete temporary files after ISO creation
+- **ISO browser & restore** — list and extract files from ISOs; re-burn
+- **Auto-install** — missing tools via pkexec
+- **Batch compression queue** — process multiple dumps
+- **Audio/subtitle extraction** via ffprobe/ffmpeg stream selection
+- **Disc catalog** — SQLite database tracking all dumps
+- **Config profiles** — save/load device, destination, compression settings
+- **Batch queue** — collapsible panel with real-time live activity status showing the current operation at all times (dump, compress, remux, ISO create, verify, burn, extract, etc.); sequential disc processing with per-entry MKV flag
 - **Multiple drive support** — auto-detects `/dev/sr*` devices
-- **System tray** — minimize to tray with show/quit menu
+- **System tray** — minimize with show/quit
 - **Desktop notifications** via notify-send and QSystemTrayIcon
 - **Settings** — persistent device, destination, auto-eject, auto-delete, compression target
 - **Clear & Reset** — one-click clear log and reset UI
-- **Crash protection** — `faulthandler`, thread/sys excepthooks, crash dump to `~/bluray_dumper_crash.log`
+- **Crash protection** — faulthandler, thread/sys excepthooks, crash dump to `~/bluray_dumper_crash.log`
 - **In-app Disclaimer** — READ menu bar with legal disclaimer
 
 ## Workflow
 
 ```
-Insert disc → Dump → ISO → SHA256 → verify → compress/remux → AVCHD/DVD ISO → burn
+Insert disc → Dump → ISO → SHA256 → verify → compress/remux → AVCHD/DVD ISO → verify → burn
 ```
 
 Auto-delete dump folder and auto-eject disc can be toggled in Settings. Remux (no compression) skips ISO entirely and creates an MKV directly.
+
+## Known Issues
+
+- **GPU double-encode (fixed)**: earlier versions would ffmpeg-encode after GPU encode, overwriting the MKV. Now `return` prevents the second pass.
+- **AVCHD on PS4**: untested. DVD-Video is the safe choice for standalone player compatibility.
 
 ## Logs
 
@@ -109,5 +113,8 @@ All operations logged to `~/bluray_dumper.log`. Crash dumps written to `~/bluray
 
 ## Player Compatibility
 
-- **AVCHD ISO** (mkudffs, UDF 2.50): works on PS3, PS4, most standalone Blu-ray players
-- **DVD-Video ISO**: universal DVD player compatibility
+- **DVD-Video ISO** (dvdauthor + genisoimage, SD MPEG-2): tested & works on standard DVD players, PS4
+- **AVCHD ISO** (mkudffs UDF 2.50, BDMV structure, HD video): unknown — may work on PS3/PS4/Blu-ray players but not confirmed. Test your first disc. Not playable via VLC's `dvd://` or `bluray://` handlers — mount and open the file instead.
+- **MKV**: universal software playback (no disc needed)
+
+For widest disc player compatibility, choose DVD-Video over AVCHD.
