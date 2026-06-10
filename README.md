@@ -1,5 +1,3 @@
-<img width="1217" height="1312" alt="Screenshot_20260609_205305-1" src="https://github.com/user-attachments/assets/86313b41-a56b-42ba-9a37-f1c9bbe1511b" />
-
 # bluray-dumper
 
 PyQt6 GUI for dumping Blu-ray discs, creating UDF ISOs, compressing/remuxing to MKV, authoring AVCHD/DVD-Video ISOs, and burning.
@@ -68,13 +66,13 @@ Place AACS keys at `~/.config/aacs/KEYDB.cfg` and BD+ data at `~/.config/bdplus/
 
 - **Disc dump** via bluraybackup with live progress, speed (GB/h, MB/s), and ETA (same progress/ETA display also shown during compress and remux)
 - **Disc speed widget** — upper-right: spinning disc during reads, fire-colored binary chars (`010101`) during writes (red→orange→yellow gradient)
-- **ImgBurn-style quotes** — random quote in the bottom status bar
+- **Status bar quotes** — random quote in the bottom status bar
 - **UDF ISO** creation with genisoimage and SHA256 checksum verification
-- **Compression** with HandBrakeCLI or ffmpeg GPU (VAAPI/AMF/NVENC/QSV) — auto-detected
+- **Compression** with HandBrakeCLI or ffmpeg GPU (VAAPI and vendor encoders) — auto-detected
 - **ffmpeg fallback** — if HandBrakeCLI exits 0 with no output, ffmpeg is used automatically (GPU or CPU)
 - **English audio auto-select** — ffprobe finds first audio stream tagged `eng`
 - **Direct-to-MKV (remux)** — `ffmpeg -c copy`, no re-encode, no ISO
-- **AVCHD ISO** — remux MKV → M2TS → BDMV structure → mkudffs UDF 2.50 ISO (verified after population)
+- **AVCHD ISO** — remux MKV → M2TS → BDMV structure → mkudffs UDF 2.01 → loop mount + populate → byte-patch to UDF 2.50 (verified after population)
 - **DVD-Video ISO** — ffmpeg MPEG-2 encode → dvdauthor → genisoimage UDF ISO
 - **GPU encode** — auto-detects h264_vaapi, h264_amf, h264_nvenc, h264_qsv
 - **Burn ISO** — "Open in K3B" or "Burn with wodim" (pkexec); auto-eject after burn
@@ -105,7 +103,8 @@ Auto-delete dump folder and auto-eject disc can be toggled in Settings. Remux (n
 ## Known Issues
 
 - **GPU double-encode (fixed)**: earlier versions would ffmpeg-encode after GPU encode, overwriting the MKV. Now `return` prevents the second pass.
-- **AVCHD on PS4**: untested. DVD-Video is the safe choice for standalone player compatibility.
+- **AVCHD on PS4**: untested. Uses `mkudffs --media-type hd --udfrev 2.01` (rewritable loop-mount) then patches UDF rev bytes to 2.50. DomainFlags left at 0x00 (reference discs use 0x03) — may need adjustment if PS4 rejects.
+- **Verification false positives (fixed)**: `rg` without `-a` skips binary ISOs; `BDMV/index.bdmv` never matched since UDF stores bare filenames, not paths. Both fixed.
 
 ## Logs
 
@@ -114,7 +113,7 @@ All operations logged to `~/bluray_dumper.log`. Crash dumps written to `~/bluray
 ## Player Compatibility
 
 - **DVD-Video ISO** (dvdauthor + genisoimage, SD MPEG-2): tested & works on standard DVD players, PS4
-- **AVCHD ISO** (mkudffs UDF 2.50, BDMV structure, HD video): unknown — may work on PS3/PS4/Blu-ray players but not confirmed. Test your first disc. Not playable via VLC's `dvd://` or `bluray://` handlers — mount and open the file instead.
+- **AVCHD ISO** (mkudffs UDF 2.01 → byte-patched to 2.50, BDMV structure, HD video): unknown — may work on PS3/PS4/Blu-ray players but not confirmed. DomainFlags = 0x00 (reference discs use 0x03). Test your first disc. Not playable via VLC's `dvd://` or `bluray://` handlers — mount and open the file instead.
 - **MKV**: universal software playback (no disc needed)
 
 For widest disc player compatibility, choose DVD-Video over AVCHD.
