@@ -1,3 +1,4 @@
+<img width="1224" height="1238" alt="Screenshot_20260608_033316" src="https://github.com/user-attachments/assets/6df5e5e0-0838-4ba4-96ff-74e4b99eab6c" />
 
 # bluray-dumper
 
@@ -104,7 +105,7 @@ Auto-delete dump folder and auto-eject disc can be toggled in Settings. Remux (n
 ## Known Issues
 
 - **GPU double-encode (fixed)**: earlier versions would ffmpeg-encode after GPU encode, overwriting the MKV. Now `return` prevents the second pass.
-- **AVCHD on PS4**: untested. Uses `mkudffs --media-type hd --udfrev 2.01` (rewritable loop-mount) then patches UDF rev bytes to 2.50. DomainFlags left at 0x00 (reference discs use 0x03) — may need adjustment if PS4 rejects.
+- **AVCHD on PS4/standalone Blu-ray players**: works. Uses `mkudffs --media-type hd --udfrev 2.01` (rewritable loop-mount) then patches UDF rev bytes to 2.50. DomainFlags left at 0x00 (reference discs use 0x03) — confirmed working on PS4 and standalone Blu-ray player without adjustment.
 - **Verification false positives (fixed)**: `rg` without `-a` skips binary ISOs; `BDMV/index.bdmv` never matched since UDF stores bare filenames, not paths. Both fixed.
 
 ## Logs
@@ -114,7 +115,7 @@ All operations logged to `~/bluray_dumper.log`. Crash dumps written to `~/bluray
 ## Player Compatibility
 
 - **DVD-Video ISO** (dvdauthor + genisoimage, SD MPEG-2): tested & works on standard DVD players, PS4
-- **AVCHD ISO** (mkudffs UDF 2.01 → byte-patched to 2.50, BDMV structure, HD video): unknown — may work on PS3/PS4/Blu-ray players but not confirmed. DomainFlags = 0x00 (reference discs use 0x03). Test your first disc. Not playable via VLC's `dvd://` or `bluray://` handlers — mount and open the file instead.
+- **AVCHD ISO** (mkudffs UDF 2.01 → byte-patched to 2.50, BDMV structure, HD video): tested and works on PS4 and standalone Blu-ray players (confirmed on 3D-capable player). DomainFlags = 0x00. Not playable via VLC's `dvd://` or `bluray://` handlers — mount and open the file instead.
 - **MKV**: universal software playback (no disc needed)
 
 For widest disc player compatibility, choose DVD-Video over AVCHD.
