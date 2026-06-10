@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sys, os, re, struct, subprocess, time, shutil, signal, logging, traceback, hashlib, sqlite3, json, ast, glob, faulthandler, threading, platform, random, random
+import sys, os, re, struct, subprocess, time, shutil, signal, logging, traceback, hashlib, sqlite3, json, ast, glob, faulthandler, threading, platform, random, urllib.request, urllib.error, urllib.parse
 from pathlib import Path
 from datetime import timedelta
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -32,6 +32,8 @@ TOOL_INSTALL = {
                     '   apt install util-linux     # Debian/Ubuntu',
     'mkudffs':      '   pacman -S udftools          # Arch\n'
                     '   apt install udftools        # Debian/Ubuntu',
+    'tsmuxer':      '   pacman -S tsmuxer           # Arch (AUR)\n'
+                    '   apt install tsmuxer         # Debian/Ubuntu',
 }
 TOOL_PACKAGES = {
     'pacman': {
@@ -45,6 +47,7 @@ TOOL_PACKAGES = {
         'isoinfo': 'cdrtools',
         'git': 'git',
         'dvdauthor': 'dvdauthor',
+        'tsmuxer': 'tsmuxer',
     },
     'apt': {
         'bluraybackup': 'bluraybackup',
@@ -57,18 +60,7 @@ TOOL_PACKAGES = {
         'isoinfo': 'genisoimage',
         'git': 'git',
         'dvdauthor': 'dvdauthor',
-    },
-    'dnf': {
-        'bluraybackup': 'bluraybackup',
-        'genisoimage': 'genisoimage',
-        'blockdev': 'util-linux',
-        'mkudffs': 'udftools',
-        'HandBrakeCLI': 'HandBrakeCLI',
-        'ffmpeg': 'ffmpeg',
-        'blkid': 'util-linux',
-        'isoinfo': 'genisoimage',
-        'git': 'git',
-        'dvdauthor': 'dvdauthor',
+        'tsmuxer': 'tsmuxer',
     },
 }
 
@@ -344,32 +336,6 @@ def get_mounts(device):
     return []
 
 
-def create_avchd_structure(m2ts_path, output_dir):
-    bdmv = output_dir / 'BDMV'
-    (bdmv / 'PLAYLIST').mkdir(parents=True, exist_ok=True)
-    (bdmv / 'CLIPINF').mkdir(parents=True, exist_ok=True)
-    (bdmv / 'STREAM').mkdir(parents=True, exist_ok=True)
-
-    cert_dir = output_dir / 'CERTIFICATE'
-    cert_dir.mkdir(parents=True, exist_ok=True)
-    id_data = bytearray(6144)
-    id_data[0:12] = b'CERTIFICATE\x00\x00\x00'
-    id_bytes = bytes(id_data)
-    (cert_dir / 'id.bdmv').write_bytes(id_bytes)
-    log.debug('Wrote CERTIFICATE/id.bdmv (%d bytes)', len(id_bytes))
-
-    stream_file = bdmv / 'STREAM' / '00000.m2ts'
-    shutil.copy2(m2ts_path, stream_file)
-    file_size = stream_file.stat().st_size
-
-    duration_sec = _get_m2ts_duration(m2ts_path)
-    _write_index_bdmv(bdmv / 'index.bdmv')
-    _write_movieobject_bdmv(bdmv / 'MovieObject.bdmv')
-    _write_playlist(bdmv / 'PLAYLIST' / '00000.mpls', duration_sec)
-    _write_clipinfo(bdmv / 'CLIPINF' / '00000.clpi', file_size, duration_sec)
-    log.info('AVCHD structure created at %s', bdmv)
-
-
 def _write_minimal_dvd_ifo(video_ts_dir):
     for name in ('VIDEO_TS.IFO', 'VIDEO_TS.BUP',
                  'VTS_01_0.IFO', 'VTS_01_0.BUP'):
@@ -380,141 +346,6 @@ def _write_minimal_dvd_ifo(video_ts_dir):
                 data[0:12] = b'DVDVIDEOMG\x00\x00'
             p.write_bytes(bytes(data))
     log.info('Minimal IFO placeholders written to %s', video_ts_dir)
-
-
-def _get_m2ts_duration(m2ts_path):
-    try:
-        r = subprocess.run(['ffprobe', '-v', 'error',
-                           '-show_entries', 'format=duration',
-                           '-of', 'default=noprint_wrappers=1:nokey=1',
-                           str(m2ts_path)],
-                          capture_output=True, text=True, timeout=30)
-        if r.returncode == 0 and r.stdout.strip():
-            return float(r.stdout.strip())
-    except Exception as e:
-        log.warning('ffprobe duration failed: %s', e)
-    return 0.0
-
-
-def _write_index_bdmv(path):
-    offset = 0x20
-    data = bytearray()
-    data += b'INDX'
-    data += struct.pack('>HH', 0x0100, 0x2400)
-    data += struct.pack('>II', offset, 0)
-    data += b'\x00' * 16
-    while len(data) < offset:
-        data += b'\x00'
-    data += struct.pack('>I', 1)
-    data += struct.pack('>H', 1)
-    data += b'00000'
-    data += struct.pack('>BB', 1, 0)
-    data += struct.pack('>II', 0xFFFFFFFF, 1)
-    data += struct.pack('>II', 0xFFFFFFFF, 0)
-    path.write_bytes(bytes(data))
-    log.debug('Wrote index.bdmv (%d bytes)', len(data))
-
-
-def _write_movieobject_bdmv(path):
-    data = bytearray()
-    data += b'MOBJ'
-    data += struct.pack('>HH', 0x0100, 0x2400)
-    data += struct.pack('>II', 0x0010, 0)
-    data += b'\x00' * 8
-    data += struct.pack('>H', 2)
-    data += struct.pack('>H', 0x0100)
-    data += struct.pack('>IIII', 0xFFFFFFFF, 0xFFFFFFFF, 0, 1)
-    path.write_bytes(bytes(data))
-    log.debug('Wrote MovieObject.bdmv (%d bytes)', len(data))
-
-
-def _write_playlist(path, duration_sec, has_audio=True):
-    total_ticks = int(duration_sec * 45000)
-    stn_buf = bytearray()
-    stn_buf += struct.pack('>H', 1 if has_audio else 0)
-    stn_buf += b'\x00' * 2
-    stn_buf += struct.pack('>B', 1)
-    stn_buf += struct.pack('>B', 0x1B)
-    stn_buf += b'\x00' * 4
-    stn_buf += struct.pack('>I', 0)
-    stn_buf += struct.pack('>I', 0xFFFFFFFF)
-    if has_audio:
-        stn_buf += struct.pack('>B', 1)
-        stn_buf += struct.pack('>B', 0x80)
-        stn_buf += b'\x00' * 4
-    stn_buf += struct.pack('>B', 0x80 if has_audio else 0)
-    stn_buf += struct.pack('>B', 0x00)
-    stn_buf += b'\x00' * 3
-    stn_buf += struct.pack('>B', 1)
-    stn_buf += b'\x00' * 3
-    stn_buf += struct.pack('>B', 1)
-    stn_buf += b'\x00' * 3
-    stn_length = len(stn_buf)
-
-    data = bytearray()
-    data += b'MPLS'
-    data += struct.pack('>HH', 0x0100, 0x2400)
-    data += struct.pack('>II', 0x003A, 0)
-    data += b'\x00' * 16
-    while len(data) < 0x3A:
-        data += b'\x00'
-    data += struct.pack('>H', 1)
-    data += struct.pack('>H', 0)
-    data += struct.pack('>B', 1)
-    data += b'\x00' * 3
-    data += struct.pack('>II', 0, total_ticks)
-    data += struct.pack('>II', 0, 0)
-    data += struct.pack('>H', 1)
-    data += struct.pack('>H', 0xFFFF)
-    data += b'00000'
-    data += struct.pack('>B', 0x60)
-    data += struct.pack('>B', 0)
-    data += b'\x00' * 2
-    data += b'\x00' * 2
-    data += struct.pack('>H', stn_length)
-    data += stn_buf
-    path.write_bytes(bytes(data))
-    log.debug('Wrote playlist (%d bytes, %.1f sec)', len(data), duration_sec)
-
-
-def _write_clipinfo(path, file_size, duration_sec, has_audio=True):
-    total_ticks = int(duration_sec * 45000)
-    data = bytearray()
-    data += b'CLPI'
-    data += struct.pack('>HH', 0x0100, 0x2400)
-    data += struct.pack('>II', 0x0038, 0)
-    data += b'\x00' * 16
-    while len(data) < 0x38:
-        data += b'\x00'
-    data += b'00000'
-    data += struct.pack('>BB', 1, 0)
-    data += struct.pack('>IH', 0, 0)
-    data += struct.pack('>II', 0, total_ticks)
-    data += struct.pack('>II', 0, total_ticks)
-    data += struct.pack('>Q', file_size)
-    data += struct.pack('>II', 0, total_ticks)
-    data += struct.pack('>II', 0, total_ticks)
-    data += struct.pack('>II', 0, total_ticks)
-    data += struct.pack('>II', 0, 1)
-    data += struct.pack('>H', 1)
-    data += struct.pack('>H', 1 if has_audio else 0)
-    data += struct.pack('>B', 1)
-    data += struct.pack('>B', 0x1B)
-    data += struct.pack('>H', 0x1011)
-    data += struct.pack('>H', 0)
-    data += struct.pack('>I', 0)
-    data += struct.pack('>I', 0xFFFFFFFF)
-    if has_audio:
-        data += struct.pack('>B', 1)
-        data += struct.pack('>B', 0x80)
-        data += struct.pack('>H', 0x1100)
-        data += struct.pack('>H', 0)
-        data += struct.pack('>B', 0x80)
-        data += struct.pack('>B', 0x00)
-        data += struct.pack('>B', 0x00)
-        data += struct.pack('>B', 0x00)
-    path.write_bytes(bytes(data))
-    log.debug('Wrote clipinfo (%d bytes, size=%d)', len(data), file_size)
 
 
 def sanitize_filename(name):
@@ -596,6 +427,12 @@ class SettingsDialog(QDialog):
         self.auto_delete_cb = QCheckBox('Delete dump folder after ISO verified')
         form.addRow(self.auto_delete_cb)
 
+        self.keep_debug_cb = QCheckBox('Keep AVCHD structure files on failure (debug)')
+        form.addRow(self.keep_debug_cb)
+
+        self.lookup_meta_cb = QCheckBox('Look up Blu-ray metadata (Wikipedia)')
+        form.addRow(self.lookup_meta_cb)
+
         layout.addLayout(form)
 
         compress_group = QGroupBox('Compression')
@@ -611,7 +448,7 @@ class SettingsDialog(QDialog):
         self.custom_size_edit.setEnabled(False)
         compress_form.addRow('Custom GB:', self.custom_size_edit)
         compress_layout.addLayout(compress_form)
-        note = QLabel('Requires HandBrakeCLI. Encodes the main movie to fit the target.')
+        note = QLabel('Requires HandBrakeCLI or ffmpeg. Encodes the main movie to fit the target.')
         note.setStyleSheet('color: #888; font-size: 11px;')
         note.setWordWrap(True)
         compress_layout.addWidget(note)
@@ -649,12 +486,16 @@ class SettingsDialog(QDialog):
         if tidx >= 0:
             self.compress_target_combo.setCurrentIndex(tidx)
         self.custom_size_edit.setText(s.value('compress_custom_gb', ''))
+        self.keep_debug_cb.setChecked(s.value('keep_debug_files', 'false') == 'true')
+        self.lookup_meta_cb.setChecked(s.value('lookup_metadata', 'false') == 'true')
 
     def save_settings(self):
         s = QSettings('BluRayDumper', 'dumper')
         s.setValue('device', self.device_combo.currentText())
         s.setValue('auto_eject', 'true' if self.auto_eject_cb.isChecked() else 'false')
         s.setValue('auto_delete', 'true' if self.auto_delete_cb.isChecked() else 'false')
+        s.setValue('keep_debug_files', 'true' if self.keep_debug_cb.isChecked() else 'false')
+        s.setValue('lookup_metadata', 'true' if self.lookup_meta_cb.isChecked() else 'false')
         s.setValue('compress_target', self.compress_target_combo.currentData())
         s.setValue('compress_custom_gb', self.custom_size_edit.text())
         self.accept()
@@ -1072,28 +913,41 @@ class CompressWorker(QThread):
                     '-profile:v', 'high', '-level', '4.0']
 
         audio_idx = self._find_english_audio_idx(main_movie)
-        cmd += ['-pix_fmt', 'yuv420p',
-                '-c:a', 'ac3', '-b:a', '448k',
-                '-map', '0:v:0', '-map', f'0:a:{audio_idx}',
-                '-y', str(self.output_path)]
 
         if self.target_bytes > 0:
             duration = self._get_duration(main_movie)
             if duration > 0:
                 total_kbps = int(self.target_bytes * 8 / duration / 1000)
                 video_kbps = max(100, int((total_kbps - 448) * 0.95))
-                gpu_rate_opts = ['-b:v', f'{video_kbps}k']
                 if gpu_encoder == 'h264_vaapi':
-                    gpu_rate_opts = ['-b:v', f'{video_kbps}k', '-maxrate', f'{int(video_kbps*1.2)}k']
+                    gpu_rate_opts = ['-b:v', f'{video_kbps}k', '-maxrate', f'{int(video_kbps*1.2)}k',
+                                     '-rc_mode', 'VBR']
+                elif gpu_encoder == 'h264_nvenc':
+                    gpu_rate_opts = ['-b:v', f'{video_kbps}k', '-maxrate', f'{video_kbps}k',
+                                     '-bufsize', f'{int(video_kbps*2)}k', '-rc:v', 'vbr_hq']
+                elif gpu_encoder == 'h264_amf':
+                    gpu_rate_opts = ['-b:v', f'{video_kbps}k', '-maxrate', f'{video_kbps}k',
+                                     '-rc', 'cbr']
+                elif gpu_encoder == 'h264_qsv':
+                    gpu_rate_opts = ['-b:v', f'{video_kbps}k', '-maxrate', f'{video_kbps}k']
+                else:
+                    gpu_rate_opts = ['-b:v', f'{video_kbps}k', '-maxrate', f'{int(video_kbps*1.2)}k',
+                                     '-bufsize', f'{int(video_kbps*2)}k']
                 cmd += gpu_rate_opts
                 log.info('ffmpeg compression target: %d bytes, video bitrate %d kbps, encoder=%s',
                          self.target_bytes, video_kbps, gpu_encoder or 'libx264')
             else:
+                log.warning('Could not determine duration for %s, falling back to QP 22', main_movie)
                 gpu_qual_opts = ['-crf', '22'] if not gpu_encoder else ['-qp', '22']
                 cmd += gpu_qual_opts
         else:
             gpu_qual_opts = ['-crf', '22'] if not gpu_encoder else ['-qp', '22']
             cmd += gpu_qual_opts
+
+        cmd += ['-pix_fmt', 'yuv420p',
+                '-c:a', 'ac3', '-b:a', '448k',
+                '-map', '0:v:0', '-map', f'0:a:{audio_idx}',
+                '-y', str(self.output_path)]
 
         log.info('Starting compression (ffmpeg): %s', ' '.join(cmd))
         self._run_subprocess(cmd, 'ffmpeg')
@@ -1320,8 +1174,8 @@ class BurnWorker(QThread):
                    str(self.iso_path)]
             self._process = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True)
-            for line in self._process.stdout:
+                text=True, bufsize=1)
+            for line in iter(self._process.stdout.readline, ''):
                 clean = line.rstrip()
                 log.info('[wodim] %s', clean)
                 self.output_line.emit(clean)
@@ -1684,7 +1538,7 @@ class DiscSpeedWidget(QWidget):
         self._binary_chars = []
         self._binary_timer = QTimer(self)
         self._binary_timer.timeout.connect(self._add_binary_char)
-        self._binary_timer.setInterval(100)
+        self._binary_timer.setInterval(50)
         self._binary_cols = 14
 
     def set_speed(self, mb_s):
@@ -1692,7 +1546,7 @@ class DiscSpeedWidget(QWidget):
 
     def set_mode(self, mode):
         self._mode = mode
-        if mode == 'writing':
+        if mode in ('writing', 'reading'):
             self._binary_chars = []
             self._binary_timer.start()
         else:
@@ -1701,7 +1555,17 @@ class DiscSpeedWidget(QWidget):
         self.update()
 
     def _add_binary_char(self):
-        self._binary_chars.append(random.choice('01'))
+        if self._mode == 'writing':
+            r = random.random()
+            if r < 0.08:
+                ch = '·'
+            elif r < 0.14:
+                ch = '°'
+            else:
+                ch = random.choice('01')
+        else:
+            ch = random.choice('01')
+        self._binary_chars.append(ch)
         max_rows = 7
         max_chars = max_rows * self._binary_cols
         if len(self._binary_chars) > max_chars:
@@ -1746,9 +1610,17 @@ class DiscSpeedWidget(QWidget):
                 row = i // self._binary_cols
                 col = i % self._binary_cols
                 t = i / max(total, 1)
-                r = int(min(255, 255 * (1 - t * 0.4)))
-                g = int(min(255, 100 + 155 * (1 - t)))
-                b = int(min(255, max(0, 80 - 80 * t)))
+                r = int(min(255, 255 * (1 - t * 0.6)))
+                g = int(min(255, 180 * (1 - t * 0.7)))
+                b = int(min(255, max(0, 50 - 50 * t)))
+                flicker = 0.65 + 0.35 * random.random()
+                r = min(255, int(r * flicker))
+                g = min(255, int(g * flicker))
+                b = min(255, int(b * flicker))
+                if ch_ in ('·', '°'):
+                    r = 255
+                    g = min(255, int(220 * flicker))
+                    b = min(255, int(180 * flicker))
                 p.setPen(QColor(r, g, b))
                 p.drawText(start_x + col * cw, start_y + row * ch, ch_)
             p.restore()
@@ -1774,6 +1646,25 @@ class DiscSpeedWidget(QWidget):
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QBrush(cg))
             p.drawEllipse(QPointF(0, 0), outer - 2, outer - 2)
+            p.restore()
+            p.save()
+            clip = QPainterPath()
+            clip.addEllipse(QPointF(cx, cy), outer - 2, outer - 2)
+            p.setClipPath(clip)
+            p.setFont(QFont('monospace', 6))
+            cw, ch = 6, 10
+            start_x = int(cx - (self._binary_cols * cw / 2))
+            start_y = int(cy - 3 * ch)
+            total = len(self._binary_chars)
+            for i, ch_ in enumerate(self._binary_chars):
+                row = i // self._binary_cols
+                col = i % self._binary_cols
+                t = i / max(total, 1)
+                green = int(min(255, 80 + 175 * (1 - t)))
+                bright = 0.7 + 0.3 * random.random()
+                green = min(255, int(green * bright))
+                p.setPen(QColor(0, green, 0))
+                p.drawText(start_x + col * cw, start_y + row * ch, ch_)
             p.restore()
             if self._speed_mb_s > 0:
                 txt = f'{self._speed_mb_s:.1f} MB/s'
@@ -1815,14 +1706,21 @@ class BluRayDumperWindow(QMainWindow):
         self.device_path = DEFAULT_DEVICE
         self.auto_eject = False
         self.auto_delete = False
+        self.keep_debug_files = False
         self.compress_target = ''
         self.compress_custom_gb = ''
+        self.lookup_metadata = False
+        self._movie_meta = None
         self._last_sha256 = ''
         self.direct_to_mkv = False
         self.extract_worker = None
         self.batch_compress_worker = None
         self.remux_worker = None
         self.burner = None
+        self._current_subprocess = None
+        self._process_mkv_path = None
+        self._process_iso_tmpdir = None
+        self._clear_attempts = 0
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -1861,9 +1759,16 @@ class BluRayDumperWindow(QMainWindow):
         disc_frame = QFrame()
         disc_frame.setFrameStyle(QFrame.Shape.StyledPanel)
         dfl = QVBoxLayout(disc_frame)
+        disc_top = QHBoxLayout()
+        self.poster_label = QLabel()
+        self.poster_label.setFixedSize(80, 120)
+        self.poster_label.setScaledContents(True)
+        self.poster_label.hide()
+        disc_top.addWidget(self.poster_label, alignment=Qt.AlignmentFlag.AlignLeft)
         self.disc_info = QLabel('Checking system...')
         self.disc_info.setStyleSheet('color: #bbb;')
-        dfl.addWidget(self.disc_info)
+        disc_top.addWidget(self.disc_info)
+        dfl.addLayout(disc_top)
 
         top_row = QHBoxLayout()
         top_left = QVBoxLayout()
@@ -1925,6 +1830,12 @@ class BluRayDumperWindow(QMainWindow):
         self.restore_btn = QPushButton('Restore from ISO')
         self.restore_btn.clicked.connect(self.open_restore)
         feature_row.addWidget(self.restore_btn)
+        self.process_iso_btn = QPushButton('Process ISO')
+        self.process_iso_btn.clicked.connect(self.process_iso)
+        feature_row.addWidget(self.process_iso_btn)
+        self.process_mkv_btn = QPushButton('Process MKV')
+        self.process_mkv_btn.clicked.connect(self.process_mkv)
+        feature_row.addWidget(self.process_mkv_btn)
         self.clear_btn = QPushButton('Clear & Reset')
         self.clear_btn.setStyleSheet('color: #d9a04a;')
         self.clear_btn.clicked.connect(self.clear_state)
@@ -2056,6 +1967,7 @@ class BluRayDumperWindow(QMainWindow):
         self.device_path = settings.value('device', DEFAULT_DEVICE)
         self.auto_eject = settings.value('auto_eject', 'false') == 'true'
         self.auto_delete = settings.value('auto_delete', 'false') == 'true'
+        self.keep_debug_files = settings.value('keep_debug_files', 'false') == 'true'
         self.compress_target = settings.value('compress_target', '')
         self.compress_custom_gb = settings.value('compress_custom_gb', '')
         self.direct_to_mkv = settings.value('direct_to_mkv', 'false') == 'true'
@@ -2221,6 +2133,8 @@ class BluRayDumperWindow(QMainWindow):
         self.disc_info.setText(info)
         self.status_label.setText('Disc ready')
         log.info('Detected disc: %s (%.2f GB)', self.disc_label, self.disc_size / (1024**3))
+        if self.lookup_metadata and self.disc_label and self.disc_label != 'Unknown Blu-ray':
+            self._lookup_metadata(self.disc_label)
         self.check_ready()
 
     def select_destination(self):
@@ -2252,12 +2166,14 @@ class BluRayDumperWindow(QMainWindow):
             self.device_path = s.value('device', DEFAULT_DEVICE)
             self.auto_eject = s.value('auto_eject', 'false') == 'true'
             self.auto_delete = s.value('auto_delete', 'false') == 'true'
+            self.keep_debug_files = s.value('keep_debug_files', 'false') == 'true'
             self.compress_target = s.value('compress_target', '')
             self.compress_custom_gb = s.value('compress_custom_gb', '')
+            self.lookup_metadata = s.value('lookup_metadata', 'false') == 'true'
             log.info('Settings updated: device=%s, auto_eject=%s, auto_delete=%s, '
-                     'compress=%s',
+                     'compress=%s, lookup_metadata=%s',
                      self.device_path, self.auto_eject, self.auto_delete,
-                     self.compress_target)
+                     self.compress_target, self.lookup_metadata)
 
     def open_destination(self):
         target = self._dump_path if self._dump_path and self._dump_path.exists() else self.dest_dir
@@ -2474,9 +2390,10 @@ class BluRayDumperWindow(QMainWindow):
             if reply != QMessageBox.StandardButton.Yes:
                 return
 
+        suggested = self._movie_meta['title'] if self._movie_meta and self._movie_meta.get('title') else self.disc_label
         label, ok = QInputDialog.getText(self, 'Rename Disc',
                                           'Disc label:',
-                                          text=self.disc_label)
+                                          text=suggested)
         if not ok or not label.strip():
             return
         self.disc_label = label.strip()
@@ -2869,14 +2786,14 @@ class BluRayDumperWindow(QMainWindow):
         elif compress_target in TARGET_SIZES:
             compress_bytes = TARGET_SIZES[compress_target]
 
-        if compress_target and compress_bytes > 0 and tool_available('HandBrakeCLI'):
+        has_encoder = tool_available('HandBrakeCLI') or tool_available('ffmpeg')
+        if compress_target and compress_bytes > 0 and has_encoder:
             label = TARGET_LABELS.get(compress_target, f'{compress_bytes / 1e9:.1f} GB')
             reply = QMessageBox.question(
                 self, 'Compress ISO',
                 f'ISO verified ({iso_size / (1024**3):.2f} GB).\n\n'
                 f'Compress main movie to fit {label}?\n\n'
-                f'This will create an MKV alongside the ISO.\n'
-                f'Requires HandBrakeCLI.',
+                f'This will create an MKV alongside the ISO.',
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if reply == QMessageBox.StandardButton.Yes:
                 self._pending_auto_delete = self.auto_delete
@@ -2900,7 +2817,7 @@ class BluRayDumperWindow(QMainWindow):
         if self.auto_eject:
             self.eject_disc()
 
-        if not compress_target or not tool_available('HandBrakeCLI'):
+        if not compress_target or not has_encoder:
             QMessageBox.information(self, 'ISO Complete',
                                     f'ISO saved as:\n{self.iso_path}{sha_note}')
         self.queue_next()
@@ -2931,13 +2848,28 @@ class BluRayDumperWindow(QMainWindow):
         self.cancel_btn.setVisible(self._working)
         self.cancel_btn.setEnabled(self._working)
         self.batch_compress_btn.setEnabled(not self._working)
+        self.process_iso_btn.setEnabled(not self._working)
+        self.process_mkv_btn.setEnabled(not self._working)
         self.extract_btn.setEnabled(not self._working and self._dump_path is not None)
         self.restore_btn.setEnabled(not self._working)
 
     def clear_state(self):
         if self._working:
-            QMessageBox.warning(self, 'Busy', 'Cannot reset while working.')
+            self._clear_attempts += 1
+            if self._clear_attempts == 1:
+                QMessageBox.warning(self, 'Busy', 'No')
+            elif self._clear_attempts >= 2:
+                QMessageBox.critical(self, 'Busy',
+                    'God dangit, I told you No, press cancel then clear the UI')
             return
+        self._clear_attempts = 0
+        if self._process_iso_tmpdir:
+            shutil.rmtree(self._process_iso_tmpdir, ignore_errors=True)
+            self._process_iso_tmpdir = None
+        self._process_mkv_path = None
+        self._movie_meta = None
+        self.poster_label.hide()
+        self.poster_label.clear()
         self.disc_label = None
         self.disc_size = 0
         self._dump_path = None
@@ -3046,6 +2978,59 @@ class BluRayDumperWindow(QMainWindow):
                 return True
         return False
 
+    @property
+    def _movie_name(self):
+        if self._movie_meta and self._movie_meta.get('title'):
+            return sanitize_filename(self._movie_meta['title'])
+        if self._dump_path:
+            return sanitize_filename(self._dump_path.name)
+        if self.disc_label:
+            return sanitize_filename(self.disc_label)
+        return 'Movie'
+
+    def _lookup_metadata(self, query):
+        self._movie_meta = None
+        try:
+            safe = urllib.parse.quote(query.replace(' ', '_'))
+            url = f'https://en.wikipedia.org/api/rest_v1/page/summary/{safe}'
+            req = urllib.request.Request(url, headers={
+                'User-Agent': 'BluRayDumper/1.0'})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                data = json.loads(r.read().decode())
+            if data.get('title') and data.get('extract'):
+                self._movie_meta = {
+                    'title': data['title'],
+                    'year': '',
+                    'description': data.get('extract', '')[:200],
+                }
+                m = re.search(r'(\d{4})\s+film', data.get('description', '') or '')
+                if m:
+                    self._movie_meta['year'] = m.group(1)
+                thumb = data.get('thumbnail', {})
+                if thumb and thumb.get('source'):
+                    try:
+                        img_req = urllib.request.Request(
+                            thumb['source'], headers={'User-Agent': 'BluRayDumper/1.0'})
+                        with urllib.request.urlopen(img_req, timeout=10) as img_r:
+                            img_data = img_r.read()
+                        pixmap = QPixmap()
+                        pixmap.loadFromData(img_data)
+                        if not pixmap.isNull():
+                            self.poster_label.setPixmap(pixmap)
+                            self.poster_label.show()
+                            self._movie_meta['poster'] = thumb['source']
+                    except Exception as e:
+                        log.debug('Poster download failed: %s', e)
+                self.disc_info.setText(
+                    f'Disc: {self.disc_label}\n'
+                    f'Movie: {self._movie_meta["title"]}'
+                    f'{" (" + self._movie_meta["year"] + ")" if self._movie_meta["year"] else ""}')
+                log.info('Metadata found: %s (%s)',
+                         self._movie_meta['title'], self._movie_meta.get('year', '?'))
+        except Exception as e:
+            log.debug('Metadata lookup failed for "%s": %s', query, e)
+            self._movie_meta = None
+
     def _get_compress_bytes(self):
         target = self.compress_target
         if target == 'custom':
@@ -3064,6 +3049,7 @@ class BluRayDumperWindow(QMainWindow):
             QMessageBox.critical(self, 'Error', 'Dump folder not found.')
             return
 
+        self._last_compress_target_bytes = target_bytes
         out_name = sanitize_filename(self._dump_path.name) + '_compressed.mkv'
         out_path = self._dump_path.parent / out_name
 
@@ -3148,9 +3134,26 @@ class BluRayDumperWindow(QMainWindow):
             self.burner.wait(5000)
             self.burner = None
 
+        if self._current_subprocess and self._current_subprocess.poll() is None:
+            log.warning('Killing running subprocess (pid=%d)', self._current_subprocess.pid)
+            self._current_subprocess.kill()
+            try:
+                self._current_subprocess.wait(5)
+            except subprocess.TimeoutExpired:
+                pass
+            self._current_subprocess = None
+
         if hasattr(self, '_batch_compress_queue'):
             self._batch_compress_queue = []
 
+        if self._process_iso_tmpdir:
+            shutil.rmtree(self._process_iso_tmpdir, ignore_errors=True)
+            self._process_iso_tmpdir = None
+        self._process_mkv_path = None
+        self._clear_attempts = 0
+        self._movie_meta = None
+        self.poster_label.hide()
+        self.poster_label.clear()
         self._working = False
         self._disc_widget.set_mode('idle')
         self._disc_widget.set_speed(0)
@@ -3328,9 +3331,9 @@ class BluRayDumperWindow(QMainWindow):
             target_bytes = dialog.get_target_bytes()
             if not folders or target_bytes <= 0:
                 return
-            if not ensure_tool('HandBrakeCLI', parent=self):
+            if not ensure_tool('HandBrakeCLI', parent=self) and not ensure_tool('ffmpeg', parent=self):
                 QMessageBox.critical(self, 'Missing Tool',
-                                     'HandBrakeCLI is not installed.')
+                                     'Neither HandBrakeCLI nor ffmpeg is installed.')
                 return
             self._batch_compress_queue = folders
             self._batch_compress_target = target_bytes
@@ -3355,6 +3358,109 @@ class BluRayDumperWindow(QMainWindow):
         self._dump_path = folder
         self.start_compress(self._batch_compress_target)
 
+    def process_mkv(self):
+        if self._working:
+            QMessageBox.warning(self, 'Busy', 'An operation is in progress.')
+            return
+        mkv_path, _ = QFileDialog.getOpenFileName(
+            self, 'Select MKV file', '', 'MKV files (*.mkv)')
+        if not mkv_path:
+            return
+        mkv_path = Path(mkv_path)
+        if not mkv_path.is_file() or mkv_path.stat().st_size < 1024 * 1024:
+            QMessageBox.critical(self, 'Invalid MKV', 'Selected file is not a valid MKV.')
+            return
+        self._process_mkv_path = mkv_path
+        target_bytes = self._get_compress_bytes()
+        self._offer_dvd_output(mkv_path, target_bytes)
+
+    def process_iso(self):
+        if self._working:
+            QMessageBox.warning(self, 'Busy', 'An operation is in progress.')
+            return
+        iso_path, _ = QFileDialog.getOpenFileName(
+            self, 'Select ISO file', '', 'ISO files (*.iso)')
+        if not iso_path:
+            return
+        iso_path = Path(iso_path)
+        if not iso_path.is_file() or iso_path.stat().st_size < 1024 * 1024:
+            QMessageBox.critical(self, 'Invalid ISO', 'Selected file is not a valid ISO.')
+            return
+
+        import tempfile
+        mnt = Path(tempfile.mkdtemp(prefix='iso_mount_'))
+        self._process_iso_tmpdir = Path(tempfile.mkdtemp(prefix='iso_extract_'))
+        stream_dir = self._process_iso_tmpdir / 'BDMV' / 'STREAM'
+        stream_dir.mkdir(parents=True)
+
+        self._set_activity('Mounting ISO...')
+        self.log_output.setText('Mounting ISO to extract main movie...')
+        QApplication.processEvents()
+        rc, out, err = self._run_subprocess_streaming(
+            ['pkexec', 'mount', '-o', 'loop,ro', str(iso_path), str(mnt)],
+            label='mount_iso', line_callback=self._on_activity_line)
+        if rc != 0:
+            err_msg = (err[-300:] if err else 'mount failed').strip()
+            QMessageBox.critical(self, 'Mount Failed',
+                f'Failed to mount ISO:\n{err_msg}')
+            shutil.rmtree(mnt, ignore_errors=True)
+            shutil.rmtree(self._process_iso_tmpdir, ignore_errors=True)
+            self._process_iso_tmpdir = None
+            return
+
+        iso_streams = list((mnt / 'BDMV' / 'STREAM').glob('*.m2ts'))
+        if not iso_streams:
+            QMessageBox.critical(self, 'No Streams',
+                'No M2TS streams found in ISO.\n'
+                'The ISO does not appear to be a Blu-ray disc image.')
+            self._run_subprocess_streaming(
+                ['pkexec', 'umount', str(mnt)], label='umount_iso')
+            shutil.rmtree(mnt, ignore_errors=True)
+            shutil.rmtree(self._process_iso_tmpdir, ignore_errors=True)
+            self._process_iso_tmpdir = None
+            return
+
+        main = max(iso_streams, key=lambda f: f.stat().st_size)
+        self._set_activity(f'Extracting main movie ({main.name})...')
+        self.log_output.setText('Copying main movie M2TS from ISO...')
+        QApplication.processEvents()
+        dest = stream_dir / main.name
+        shutil.copy2(str(main), str(dest))
+
+        self._run_subprocess_streaming(
+            ['pkexec', 'umount', str(mnt)], label='umount_iso')
+        shutil.rmtree(mnt, ignore_errors=True)
+
+        self._dump_path = self._process_iso_tmpdir
+        target_bytes = self._get_compress_bytes()
+        has_encoder = tool_available('HandBrakeCLI') or tool_available('ffmpeg')
+        if target_bytes > 0 and has_encoder:
+            self.start_compress(target_bytes)
+        elif has_encoder:
+            reply = QMessageBox.question(
+                self, 'Compress?',
+                'No compression target is set in Settings.\n\n'
+                'Compress main movie anyway (no target size)?',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.Yes:
+                self.start_compress(0)
+            else:
+                reply2 = QMessageBox.question(
+                    self, 'Create DVD?',
+                    'Create DVD-Video or AVCHD from the raw stream?',
+                    QMessageBox.StandardButton.Yes |
+                    QMessageBox.StandardButton.No)
+                if reply2 == QMessageBox.StandardButton.Yes:
+                    mkv_path = self._process_iso_tmpdir / 'main_movie.mkv'
+                    self._offer_dvd_output(mkv_path, 0)
+                else:
+                    QMessageBox.information(self, 'Done',
+                        f'Main movie extracted to:\n{dest}')
+        else:
+            QMessageBox.information(self, 'No Encoder',
+                'Neither HandBrakeCLI nor ffmpeg is available.\n\n'
+                'Main movie extracted but cannot compress.')
+
     @staticmethod
     def _is_dvd_target(target):
         return target in ('dvd5', 'dvd9')
@@ -3371,6 +3477,10 @@ class BluRayDumperWindow(QMainWindow):
             self.eject_disc()
         self._pending_auto_delete = False
         self._pending_auto_eject = False
+        if self._process_iso_tmpdir:
+            shutil.rmtree(self._process_iso_tmpdir, ignore_errors=True)
+            self._process_iso_tmpdir = None
+        self._process_mkv_path = None
         self._disc_widget.set_mode('idle')
         self._disc_widget.set_speed(0)
 
@@ -3412,8 +3522,10 @@ class BluRayDumperWindow(QMainWindow):
             self._set_activity('Compression complete')
             self.log_output.setText('Compressed MKV created.')
 
-            if tool_available('ffmpeg') and self._is_dvd_target(self.compress_target):
-                handled = self._offer_dvd_output(mkv_path)
+            target_bytes = getattr(self, '_last_compress_target_bytes', 0)
+            is_dvd = target_bytes in (TARGET_SIZES.get('dvd5'), TARGET_SIZES.get('dvd9'))
+            if tool_available('ffmpeg') and is_dvd:
+                handled = self._offer_dvd_output(mkv_path, target_bytes)
             else:
                 QMessageBox.information(
                     self, 'Compression Done',
@@ -3469,32 +3581,78 @@ class BluRayDumperWindow(QMainWindow):
         self._finish_after_compress()
         self.queue_next()
 
+    def _verify_bdmv_structure(self, bdmv_root):
+        self._set_activity('Checking BDMV structure...')
+        issues = []
+        bdmv = bdmv_root / 'BDMV'
+        if not bdmv.is_dir():
+            issues.append('BDMV/ directory missing')
+        else:
+            idx = bdmv / 'index.bdmv'
+            if not idx.is_file():
+                issues.append('BDMV/index.bdmv missing')
+            elif idx.stat().st_size == 0:
+                issues.append('BDMV/index.bdmv is empty')
+            mobj = bdmv / 'MovieObject.bdmv'
+            if not mobj.is_file():
+                issues.append('BDMV/MovieObject.bdmv missing')
+            elif mobj.stat().st_size == 0:
+                issues.append('BDMV/MovieObject.bdmv is empty')
+            for sub, label in [('PLAYLIST', '.mpls'), ('CLIPINF', '.clpi'), ('STREAM', '.m2ts')]:
+                d = bdmv / sub
+                if not d.is_dir():
+                    issues.append(f'BDMV/{sub}/ directory missing')
+                else:
+                    files = [f for f in d.iterdir() if f.suffix == label]
+                    if not files:
+                        issues.append(f'No *{label} files in BDMV/{sub}/')
+                    elif sub == 'STREAM':
+                        big = [f for f in files if f.stat().st_size > 10 * 1024 * 1024]
+                        if not big:
+                            issues.append(f'All .m2ts files in STREAM/ are < 10 MB')
+        cert = bdmv_root / 'CERTIFICATE'
+        if not cert.is_dir():
+            issues.append('CERTIFICATE/ directory missing')
+        elif not (cert / 'id.bdmv').is_file():
+            issues.append('CERTIFICATE/id.bdmv missing')
+        if issues:
+            for msg in issues:
+                log.error('Compliance: %s', msg)
+                self._set_activity(f'FAIL: {msg}')
+            log.error('BDMV structure has %d issue(s)', len(issues))
+            return False
+        log.info('BDMV structure compliance check passed')
+        self._set_activity('BDMV structure OK')
+        return True
+
     def _verify_avchd_iso(self, iso_path):
         rc, out, err = self._run_subprocess_streaming(
             ['blkid', '-p', '-o', 'value', '-s', 'VERSION', str(iso_path)],
             label='udf_verify', line_callback=self._on_activity_line)
         ver = out.strip() if rc == 0 else ''
         log.info('AVCHD ISO UDF version: %s', ver)
-        if '2.50' not in ver:
-            log.error('Expected UDF 2.50, got %s', ver)
-            return False
         rc2, out2, _ = self._run_subprocess_streaming(
-            ['rg', '-c', 'BDMV/index.bdmv', str(iso_path)],
+            ['rg', '-a', '-c', 'index.bdmv', str(iso_path)],
             label='iso_verify', line_callback=self._on_activity_line)
         rc3, out3, _ = self._run_subprocess_streaming(
-            ['rg', '-c', '00000.m2ts', str(iso_path)],
+            ['rg', '-a', '-c', '00000.m2ts', str(iso_path)],
             label='iso_verify_m2ts', line_callback=self._on_activity_line)
         ok = (rc2 == 0) and (rc3 == 0)
         if not ok:
-            log.warning('ISO missing BDMV/index.bdmv or 00000.m2ts')
+            log.warning('ISO missing index.bdmv or 00000.m2ts')
         return ok
 
-    def _offer_dvd_output(self, mkv_path):
+    def _offer_dvd_output(self, mkv_path, target_bytes=0):
+        if target_bytes <= 0:
+            target_bytes = TARGET_SIZES.get(self.compress_target, 0)
+        target_label = TARGET_LABELS.get(self.compress_target,
+                                         f'{target_bytes / 1e9:.1f} GB')
         dlg = QDialog(self)
         dlg.setWindowTitle('DVD Output Format')
         layout = QVBoxLayout(dlg)
         layout.addWidget(QLabel(
             f'Compressed video ready at:\n{mkv_path.name}\n\n'
+            f'Target size: {target_label}\n'
             'Choose output format:'))
         self._dvd_mkv_rb = QRadioButton('MKV — keep as-is')
         self._dvd_avchd_rb = QRadioButton('AVCHD ISO — UDF 2.50, BDMV structure (HD video on DVD)')
@@ -3515,9 +3673,9 @@ class BluRayDumperWindow(QMainWindow):
             return False
         iso_ok = False
         if self._dvd_vob_rb.isChecked():
-            iso_ok = self._create_dvd_video_iso(mkv_path)
+            iso_ok = self._create_dvd_video_iso(mkv_path, target_bytes)
         elif self._dvd_avchd_rb.isChecked():
-            iso_ok = self._create_avchd_iso(mkv_path)
+            iso_ok = self._create_avchd_iso(mkv_path, target_bytes)
         else:
             QMessageBox.information(
                 self, 'Compression Done',
@@ -3554,40 +3712,147 @@ class BluRayDumperWindow(QMainWindow):
             msg += '\n\nTemporary files deleted.'
         QMessageBox.information(self, 'Complete', msg)
 
-    @staticmethod
-    def _run_subprocess_streaming(cmd, timeout=3600, label='process', line_callback=None):
+    def _run_subprocess_streaming(self, cmd, timeout=3600, label='process', line_callback=None):
         stdout_lines = []
-        process = subprocess.Popen(
+        self._current_subprocess = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1)
         try:
-            for line in iter(process.stdout.readline, ''):
+            for line in iter(self._current_subprocess.stdout.readline, ''):
                 line = line.rstrip('\n\r')
                 stdout_lines.append(line)
                 if line_callback:
                     line_callback(line)
                 QApplication.processEvents()
-            process.stdout.close()
+            self._current_subprocess.stdout.close()
         except Exception as e:
-            process.kill()
+            self._current_subprocess.kill()
             raise e
-        process.wait()
+        self._current_subprocess.wait()
         stdout = '\n'.join(stdout_lines)
-        if process.returncode != 0:
+        rc = self._current_subprocess.returncode
+        self._current_subprocess = None
+        if rc != 0:
             log.error('%s failed (code=%d): stdout=%s',
-                      label, process.returncode,
+                      label, rc,
                       stdout[-500:] if stdout else '')
         else:
             log.debug('%s succeeded (code=0): stdout=%s',
                       label,
                       stdout[-200:] if stdout else '')
-        return process.returncode, stdout, ''
+        return rc, stdout, ''
 
-    def _create_avchd_iso(self, mkv_path):
+    @staticmethod
+    def _patch_udf_201_to_250(iso_path):
+        import binascii
+        blocksize = 2048
+
+        with open(iso_path, 'r+b') as f:
+            data = bytearray(f.read())
+
+        modified_blocks = set()
+        changed = False
+
+        domain_pattern = bytes([0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                0x00, 0x08, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00])
+        pos = 0
+        while True:
+            idx = data.find(domain_pattern, pos)
+            if idx < 0:
+                break
+            block_start = (idx // blocksize) * blocksize
+            tag_id = data[block_start] | (data[block_start + 1] << 8)
+            if tag_id == 0x0006:
+                if data[idx] == 0x01 and data[idx + 1] == 0x02:
+                    data[idx] = 0x50
+                    data[idx + 1] = 0x02
+                    modified_blocks.add(block_start)
+                    changed = True
+            pos = idx + 1
+
+        osta = b'*OSTA UDF Compliant'
+        valid_tags = {0x0001, 0x0004, 0x0005, 0x0006, 0x0007, 0x0009, 0x0101}
+        pos = 0
+        while True:
+            idx = data.find(osta, pos)
+            if idx < 0:
+                break
+            block_start = (idx // blocksize) * blocksize
+            tag_id = data[block_start] | (data[block_start + 1] << 8)
+            if tag_id not in valid_tags:
+                pos = idx + len(osta)
+                continue
+            search_start = idx + len(osta)
+            search_end = min(search_start + 24, len(data))
+            for rpos in range(search_start, search_end - 1):
+                if data[rpos:rpos + 2] == b'\x01\x02':
+                    data[rpos] = 0x50
+                    data[rpos + 1] = 0x02
+                    modified_blocks.add(block_start)
+                    changed = True
+                    break
+                elif data[rpos] != 0x00:
+                    break
+            pos = idx + len(osta)
+
+        for bnum in range(len(data) // blocksize):
+            boff = bnum * blocksize
+            tag_id = data[boff] | (data[boff + 1] << 8)
+            if tag_id != 0x0004:
+                continue
+            if (data[boff+20:boff+34] == b'\x00*UDF LV Info\x00' and
+                data[boff+44:boff+46] == b'\x01\x02'):
+                data[boff+44] = 0x50
+                modified_blocks.add(boff)
+                changed = True
+
+        for bnum in range(len(data) // blocksize):
+            boff = bnum * blocksize
+            tag_id = data[boff] | (data[boff + 1] << 8)
+            if tag_id != 0x0009:
+                continue
+            if data[boff+128:boff+134] == b'\x01\x02\x01\x02\x01\x02':
+                data[boff+128] = 0x50
+                data[boff+130] = 0x50
+                data[boff+132] = 0x50
+                modified_blocks.add(boff)
+                changed = True
+
+        if changed and modified_blocks:
+            for desc_start in sorted(modified_blocks):
+                if desc_start + 16 > len(data):
+                    continue
+                tag_id = data[desc_start] | (data[desc_start + 1] << 8)
+                if tag_id not in valid_tags:
+                    continue
+                crc_len = data[desc_start + 10] | (data[desc_start + 11] << 8)
+                if crc_len == 0:
+                    body = data[desc_start + 16:desc_start + blocksize]
+                    crc_len = len(body)
+                else:
+                    crc_len = min(crc_len, blocksize - 16)
+                    body = data[desc_start + 16:desc_start + 16 + crc_len]
+                if crc_len > 0:
+                    new_crc = binascii.crc_hqx(bytes(body), 0)
+                    data[desc_start + 8] = new_crc & 0xFF
+                    data[desc_start + 9] = (new_crc >> 8) & 0xFF
+                checksum = 0
+                for i in range(16):
+                    if i != 4:
+                        checksum += data[desc_start + i]
+                data[desc_start + 4] = checksum & 0xFF
+
+            with open(iso_path, 'wb') as f:
+                f.write(data)
+
+        log.info('UDF patch: %s modified=%s', iso_path, bool(changed))
+        return changed
+
+    def _create_avchd_iso(self, mkv_path, target_bytes=0):
         self._set_activity('Creating AVCHD DVD ISO...')
         self._disc_widget.set_mode('writing')
         self.status_label.setText('Creating AVCHD DVD...')
-        self.log_output.setText('Remuxing with ffmpeg...')
+        self.log_output.setText('Muxing to AVCHD with tsMuxeR...')
         QApplication.processEvents()
 
         mkv_size = Path(mkv_path).stat().st_size
@@ -3597,66 +3862,116 @@ class BluRayDumperWindow(QMainWindow):
                                  'Something went wrong during compression.')
             return
 
+        if not ensure_tool('tsmuxer', parent=self):
+            QMessageBox.critical(self, 'Missing Tool',
+                'tsMuxeR is not installed.\n'
+                f'{TOOL_INSTALL["tsmuxer"]}')
+            return
+
         name_stem = Path(mkv_path).stem.replace('_compressed', '')
         avchd_dir = Path(mkv_path).parent / f'avchd_{name_stem}'
         iso_path = avchd_dir.parent / f'{name_stem}_avchd.iso'
 
         if avchd_dir.exists():
             shutil.rmtree(avchd_dir)
-
-        log.info('AVCHD: remuxing MKV to M2TS')
-        self.log_output.setText('Remuxing to M2TS...')
-        QApplication.processEvents()
-        m2ts_path = avchd_dir / 'temp.m2ts'
         avchd_dir.mkdir(parents=True, exist_ok=True)
 
+        video_es = avchd_dir / 'video.h264'
+        audio_es = avchd_dir / 'audio.ac3'
+
+        self.log_output.setText('Demuxing video stream...')
+        QApplication.processEvents()
+        rc_v, out_v, _ = self._run_subprocess_streaming(
+            ['ffmpeg', '-i', str(mkv_path), '-map', '0:v:0', '-c:v', 'copy',
+             '-bsf:v', 'h264_mp4toannexb', '-y', str(video_es)],
+            timeout=3600, label='demux_video',
+            line_callback=self._on_activity_line)
+
+        self.log_output.setText('Demuxing audio stream...')
+        QApplication.processEvents()
+        rc_a, out_a, _ = self._run_subprocess_streaming(
+            ['ffmpeg', '-i', str(mkv_path), '-map', '0:a:0', '-c:a', 'copy',
+             '-y', str(audio_es)],
+            timeout=3600, label='demux_audio',
+            line_callback=self._on_activity_line)
+
+        if rc_v != 0 or rc_a != 0 or not video_es.exists() or not audio_es.exists():
+            err_parts = []
+            if rc_v != 0 or not video_es.exists():
+                err_parts.append(f'video demux (rc={rc_v})')
+            if rc_a != 0 or not audio_es.exists():
+                err_parts.append(f'audio demux (rc={rc_a})')
+            err_msg = 'Demuxing failed: ' + ', '.join(err_parts)
+            self.status_label.setText('AVCHD demux failed')
+            self.log_output.setText(err_msg)
+            QMessageBox.critical(self, 'AVCHD Error', err_msg)
+            if not getattr(self, 'keep_debug_files', False):
+                shutil.rmtree(avchd_dir, ignore_errors=True)
+            return
+
+        meta_path = avchd_dir / 'avchd.meta'
+        meta_content = (
+            'MUXOPT --avchd --auto-chapters=5 --vbr\n'
+            f'V_MPEG4/ISO/AVC, "{video_es}", insertSEI, contSPS\n'
+            f'A_AC3, "{audio_es}", lang=eng\n'
+        )
+        meta_path.write_text(meta_content, encoding='utf-8')
+        log.info('AVCHD meta file: %s', meta_path)
+
+        self.log_output.setText('Running tsMuxeR...')
+        QApplication.processEvents()
         rc, out, err = self._run_subprocess_streaming(
-            ['ffmpeg', '-i', str(mkv_path), '-c:v', 'copy', '-c:a', 'ac3', '-b:a', '448k',
-             '-f', 'mpegts', '-mpegts_m2ts_mode', '1', '-y', str(m2ts_path)],
-            label='ffmpeg_m2ts', line_callback=self._on_activity_line)
+            ['tsmuxer', str(meta_path), str(avchd_dir)],
+            timeout=3600, label='tsmuxer',
+            line_callback=self._on_activity_line)
+
+        video_es.unlink(missing_ok=True)
+        audio_es.unlink(missing_ok=True)
+        meta_path.unlink(missing_ok=True)
+
         if rc != 0:
-            err_msg = (err[-500:] if err else 'unknown error').strip()
-            self.status_label.setText('AVCHD remux failed')
+            err_msg = (out[-500:] if out else 'tsMuxeR failed').strip()
+            self.status_label.setText('AVCHD mux failed')
             self.log_output.setText(err_msg)
             QMessageBox.critical(self, 'AVCHD Error',
-                f'ffmpeg remux to M2TS failed (code {rc}):\n{err_msg}')
-            shutil.rmtree(avchd_dir, ignore_errors=True)
+                f'tsMuxeR muxing failed (code {rc}):\n{err_msg}')
+            if not getattr(self, 'keep_debug_files', False):
+                shutil.rmtree(avchd_dir, ignore_errors=True)
             return
 
-        if m2ts_path.stat().st_size < 10 * 1024 * 1024:
+        bdmv_dir = avchd_dir / 'BDMV'
+        if not bdmv_dir.exists() or not (bdmv_dir / 'index.bdmv').exists():
+            self.status_label.setText('AVCHD structure error')
+            self.log_output.setText('tsMuxeR did not create valid BDMV structure')
             QMessageBox.critical(self, 'AVCHD Error',
-                f'M2TS is only {m2ts_path.stat().st_size / (1024*1024):.1f} MB.\n'
-                'The video stream may be corrupt.\n'
-                f'Check {LOG_FILE} for ffprobe/ffmpeg output during remux.')
+                'tsMuxeR completed but BDMV structure is missing or incomplete.')
             shutil.rmtree(avchd_dir, ignore_errors=True)
             return
-
-        self.log_output.setText('Building AVCHD structure...')
-        QApplication.processEvents()
-        try:
-            create_avchd_structure(m2ts_path, avchd_dir)
-        except Exception as e:
-            self.status_label.setText('AVCHD structure failed')
-            err_msg = traceback.format_exc()
-            log.error('AVCHD structure creation failed:\n%s', err_msg)
-            self.log_output.setText(str(e))
-            QMessageBox.critical(self, 'AVCHD Error',
-                f'AVCHD structure creation failed:\n{e}\n\n'
-                f'Check {LOG_FILE} for details.')
-            shutil.rmtree(avchd_dir, ignore_errors=True)
-            return
-        finally:
-            if m2ts_path.exists():
-                m2ts_path.unlink()
 
         cert_dir = avchd_dir / 'CERTIFICATE'
         cert_dir.mkdir(parents=True, exist_ok=True)
-        id_data = bytearray(6144)
-        id_data[0:12] = b'CERTIFICATE\x00\x00\x00'
-        (cert_dir / 'id.bdmv').write_bytes(bytes(id_data))
+        id_bdmv = cert_dir / 'id.bdmv'
+        if not id_bdmv.exists():
+            id_data = bytearray(6144)
+            id_data[0:12] = b'CERTIFICATE\x00\x00\x00'
+            id_bdmv.write_bytes(bytes(id_data))
 
         vol_id = name_stem.replace('_', ' ')[:32].upper().strip() or 'AVCHD'
-        self.log_output.setText('Creating AVCHD ISO (UDF 2.50)...')
+
+        if not self._verify_bdmv_structure(avchd_dir):
+            self.status_label.setText('AVCHD structure invalid')
+            self.log_output.setText('BDMV compliance check failed — aborting.')
+            QMessageBox.critical(self, 'AVCHD Error',
+                'BDMV structure failed compliance check.\n'
+                'Check the activity log for details.')
+            if not self.keep_debug_files:
+                shutil.rmtree(avchd_dir, ignore_errors=True)
+            else:
+                log.info('Keeping AVCHD structure for inspection: %s', avchd_dir)
+                self._set_activity(f'Kept AVCHD structure: {avchd_dir}')
+            return
+
+        self.log_output.setText('Creating AVCHD ISO (UDF)...')
         QApplication.processEvents()
 
         if not ensure_tool('mkudffs', parent=self):
@@ -3666,16 +3981,44 @@ class BluRayDumperWindow(QMainWindow):
             shutil.rmtree(avchd_dir, ignore_errors=True)
             return
 
-        total_size = sum(f.stat().st_size for f in avchd_dir.rglob('*') if f.is_file()) + 10 * 1024 * 1024
-        blocks = (total_size + 2047) // 2048
+        content_size = sum(f.stat().st_size for f in avchd_dir.rglob('*') if f.is_file())
+        overhead = 10 * 1024 * 1024
+        if target_bytes > 0 and content_size + overhead > target_bytes:
+            over = content_size + overhead - target_bytes
+            self.status_label.setText('AVCHD content too large')
+            self.log_output.setText(f'BDMV structure {content_size / 1e9:.2f} GB exceeds target '
+                                    f'{target_bytes / 1e9:.2f} GB by {over / 1e6:.0f} MB')
+            QMessageBox.critical(self, 'AVCHD Error',
+                f'Muxed BDMV structure ({content_size / 1e9:.2f} GB) exceeds\n'
+                f'target disc size ({target_bytes / 1e9:.2f} GB) by {over / 1e6:.0f} MB.\n'
+                'Re-compress with a smaller target or use larger media.')
+            if not self.keep_debug_files:
+                shutil.rmtree(avchd_dir, ignore_errors=True)
+            return
+
+        iso_limit = target_bytes if target_bytes > 0 else content_size + overhead
+        blocks = min((iso_limit + 2047) // 2048, (content_size + overhead + 2047) // 2048)
+        log.info('AVCHD ISO size: target=%d content=%d blocks=%d expected_bytes=%d',
+                 target_bytes, content_size, blocks, blocks * 2048)
+
+        if blocks <= 0:
+            self.status_label.setText('AVCHD ISO size error')
+            self.log_output.setText(f'Invalid block count: {blocks}')
+            QMessageBox.critical(self, 'AVCHD Error',
+                f'Calculated block count is {blocks}. Check target size and content size.')
+            shutil.rmtree(avchd_dir, ignore_errors=True)
+            return
+
+        if iso_path.exists():
+            iso_path.unlink()
 
         rc, out, err = self._run_subprocess_streaming(
-            ['mkudffs', '--media-type', 'dvd', '--udfrev', '2.50',
+            ['mkudffs', '--new-file', '--media-type', 'hd', '--udfrev', '2.01',
              '--label', vol_id, '--blocksize', '2048',
              str(iso_path), str(blocks)],
             label='mkudffs', line_callback=self._on_activity_line)
         if rc != 0:
-            err_msg = (err[-500:] if err else 'unknown error').strip()
+            err_msg = (out[-500:] if out else 'unknown error').strip()
             self.status_label.setText('AVCHD ISO failed')
             self.log_output.setText(err_msg)
             QMessageBox.critical(self, 'AVCHD Error',
@@ -3683,6 +4026,17 @@ class BluRayDumperWindow(QMainWindow):
             shutil.rmtree(avchd_dir, ignore_errors=True)
             return
 
+        actual = iso_path.stat().st_size
+        expected = blocks * 2048
+        if actual < expected * 0.9:
+            iso_path.unlink()
+            self.status_label.setText('AVCHD ISO too small')
+            self.log_output.setText(f'ISO is only {actual} bytes, expected ~{expected}')
+            QMessageBox.critical(self, 'AVCHD Error',
+                f'Created ISO is too small ({actual} bytes vs {expected} expected).\n'
+                'The filesystem may be out of space or the block count was wrong.')
+            shutil.rmtree(avchd_dir, ignore_errors=True)
+            return
         iso_path.chmod(0o666)
         self.log_output.setText('Populating ISO with AVCHD structure...')
         QApplication.processEvents()
@@ -3698,9 +4052,19 @@ class BluRayDumperWindow(QMainWindow):
                 f'ISO="{iso_path}"',
                 f'SRC="{avchd_dir}"',
                 'MNT=$(mktemp -d /tmp/avchd_mount_XXXXXX)',
-                'trap "rmdir \"$MNT\" 2>/dev/null; exit" EXIT INT TERM',
+                'LOOP=""',
+                'cleanup() {',
+                '  if mountpoint -q "$MNT"; then',
+                '    umount "$MNT" 2>/dev/null || true',
+                '  fi',
+                '  if [ -n "$LOOP" ] && [ -e "$LOOP" ]; then',
+                '    losetup -d "$LOOP" 2>/dev/null || true',
+                '  fi',
+                '  rmdir "$MNT" 2>/dev/null || true',
+                '}',
+                'trap cleanup EXIT INT TERM',
                 'LOOP=$(losetup -f --show "$ISO")',
-                'mount -o rw "$LOOP" "$MNT"',
+                'mount -t udf -o rw "$LOOP" "$MNT"',
                 'cp -a "$SRC/BDMV" "$MNT/"',
                 'cp -a "$SRC/CERTIFICATE" "$MNT/"',
                 'sync',
@@ -3721,10 +4085,16 @@ class BluRayDumperWindow(QMainWindow):
                 QMessageBox.critical(self, 'AVCHD Error',
                     f'Failed to populate ISO (code {rc2}):\n{err_msg}')
                 shutil.rmtree(avchd_dir, ignore_errors=True)
+                iso_path.unlink(missing_ok=True)
                 return
         finally:
             if script_path and os.path.exists(script_path):
                 os.unlink(script_path)
+
+        self.log_output.setText('Patching UDF revision to 2.50...')
+        QApplication.processEvents()
+        if not self._patch_udf_201_to_250(iso_path):
+            log.warning('No UDF 2.01 revision bytes found to patch in %s', iso_path)
 
         shutil.rmtree(avchd_dir, ignore_errors=True)
         self._set_activity('Verifying AVCHD ISO...')
@@ -3758,7 +4128,7 @@ class BluRayDumperWindow(QMainWindow):
             pass
         return 'ntsc'
 
-    def _create_dvd_video_iso(self, mkv_path):
+    def _create_dvd_video_iso(self, mkv_path, target_bytes=0):
         self._disc_widget.set_mode('writing')
         self._set_activity('Creating DVD-Video...')
         self.status_label.setText('Creating DVD-Video...')
@@ -3923,7 +4293,6 @@ class BluRayDumperWindow(QMainWindow):
 
     def _on_burn_progress(self, pct):
         self.status_label.setText(f'Burning DVD... {pct}%')
-        self._disc_widget.set_speed(pct)
         pass
 
     def _on_burn_speed(self, speed):
@@ -4069,7 +4438,7 @@ def log_system_info():
     log.info('Python: %s', sys.version)
     log.info('Platform: %s', platform.platform())
     log.info('CPU: %s', platform.processor() or 'unknown')
-    log.info('Memory: %s', platform.machine())
+    log.info('Machine: %s', platform.machine())
     for prog, ver_flag in [('ffmpeg', '-version'), ('HandBrakeCLI', '--version'),
                             ('bluraybackup', '--version'), ('genisoimage', '--version'),
                             ('blockdev', '--version'), ('eject', '--version'),
