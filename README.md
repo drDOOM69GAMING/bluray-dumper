@@ -114,8 +114,8 @@ All operations logged to `~/bluray_dumper.log`. Crash dumps written to `~/bluray
 
 ## Player Compatibility
 
-- **DVD-Video ISO** (dvdauthor + genisoimage, SD MPEG-2): tested & works on standard DVD players, PS4
-- **AVCHD ISO** (mkudffs UDF 2.01 → byte-patched to 2.50, BDMV structure, HD video): tested and works on PS4 and standalone Blu-ray players (confirmed on 3D-capable player). DomainFlags = 0x00. Not playable via VLC's `dvd://` or `bluray://` handlers — mount and open the file instead.
+- **DVD-Video ISO** (dvdauthor + genisoimage, SD MPEG-2): tested & works on standard DVD players, PS4 see's the disc but refused to play it.
+- **AVCHD ISO** (mkudffs UDF 2.01 → byte-patched to 2.50, BDMV structure, HD video): tested and works on standalone Blu-ray players (confirmed on 3D-capable player). DomainFlags = 0x00. Not playable via VLC's `dvd://` or `bluray://` handlers — mount and open the file instead.
 - **MKV**: universal software playback (no disc needed)
 
 For widest disc player compatibility, choose DVD-Video over AVCHD.
