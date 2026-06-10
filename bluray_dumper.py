@@ -5,6 +5,7 @@ from datetime import timedelta
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QProgressBar,
                              QFileDialog, QMessageBox, QFrame, QTextEdit,
+                             QPlainTextEdit,
                              QDialog, QListWidget, QLineEdit, QCheckBox,
                              QRadioButton, QGroupBox, QFormLayout,
                              QDialogButtonBox, QInputDialog, QComboBox,
@@ -663,12 +664,15 @@ class LogViewer(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle('Blu-ray Dumper Log')
-        self.resize(700, 500)
+        self.resize(800, 550)
         layout = QVBoxLayout(self)
 
-        self.text_edit = QTextEdit()
+        self.text_edit = QPlainTextEdit()
         self.text_edit.setReadOnly(True)
-        self.text_edit.setStyleSheet('font-family: monospace; font-size: 11px;')
+        self.text_edit.setStyleSheet(
+            'QPlainTextEdit { font-family: monospace; font-size: 11px; '
+            'background-color: #1a1a1a; color: #ccc; }')
+        self.text_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         layout.addWidget(self.text_edit)
 
         btn_layout = QHBoxLayout()
@@ -686,26 +690,24 @@ class LogViewer(QDialog):
         btn_layout.addWidget(close_btn)
         layout.addLayout(btn_layout)
 
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self.load_log)
+        self._timer.start(2000)
+
         self.load_log()
 
     def load_log(self):
         try:
             content = LOG_FILE.read_text(errors='replace')
             self.text_edit.setPlainText(content)
-            self.text_edit.moveCursor(QTextCursor.MoveOperation.End)
+            vbar = self.text_edit.verticalScrollBar()
+            vbar.setValue(vbar.maximum())
         except Exception as e:
             self.text_edit.setPlainText(f'Could not load log: {e}')
 
-    def clear_log(self):
-        reply = QMessageBox.question(
-            self, 'Clear Log', 'Clear the log file?',
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply == QMessageBox.StandardButton.Yes:
-            try:
-                LOG_FILE.write_text('')
-                self.text_edit.clear()
-            except Exception as e:
-                QMessageBox.critical(self, 'Error', f'Could not clear log: {e}')
+    def closeEvent(self, event):
+        self._timer.stop()
+        super().closeEvent(event)
 
 
 class DiscCatalog:
@@ -1301,6 +1303,9 @@ class ExtractWorker(QThread):
 
 class BurnWorker(QThread):
     finished = pyqtSignal(bool, object)
+    output_line = pyqtSignal(str)
+    progress_updated = pyqtSignal(int)
+    speed_updated = pyqtSignal(float)
 
     def __init__(self, parent, iso_path, device):
         super().__init__(parent)
@@ -1317,7 +1322,17 @@ class BurnWorker(QThread):
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True)
             for line in self._process.stdout:
-                log.info('[wodim] %s', line.rstrip())
+                clean = line.rstrip()
+                log.info('[wodim] %s', clean)
+                self.output_line.emit(clean)
+                m = re.search(r'Track\s+\d+:\s+(\d+)\s+of\s+(\d+)\s+MB.*?([\d.]+)x\.', line)
+                if m:
+                    cur = int(m.group(1))
+                    total = int(m.group(2))
+                    pct = int(cur / total * 100) if total > 0 else 0
+                    speed = float(m.group(3))
+                    self.progress_updated.emit(pct)
+                    self.speed_updated.emit(speed)
             self._process.wait()
             if self._process.returncode == 0:
                 self.finished.emit(True, self.iso_path)
@@ -1723,13 +1738,18 @@ class DiscSpeedWidget(QWidget):
             clip.addEllipse(QPointF(cx, cy), outer - 2, outer - 2)
             p.setClipPath(clip)
             p.setFont(QFont('monospace', 6))
-            p.setPen(QColor(0, 210, 0))
             cw, ch = 6, 10
             start_x = int(cx - (self._binary_cols * cw / 2))
             start_y = int(cy - 3 * ch)
+            total = len(self._binary_chars)
             for i, ch_ in enumerate(self._binary_chars):
                 row = i // self._binary_cols
                 col = i % self._binary_cols
+                t = i / max(total, 1)
+                r = int(min(255, 255 * (1 - t * 0.4)))
+                g = int(min(255, 100 + 155 * (1 - t)))
+                b = int(min(255, max(0, 80 - 80 * t)))
+                p.setPen(QColor(r, g, b))
                 p.drawText(start_x + col * cw, start_y + row * ch, ch_)
             p.restore()
             txt = f'{self._speed_mb_s:.1f} MB/s' if self._speed_mb_s > 0 else 'Writing...'
@@ -1771,6 +1791,8 @@ class DiscSpeedWidget(QWidget):
 
 
 class BluRayDumperWindow(QMainWindow):
+    log_line = pyqtSignal(str)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle('Blu-ray Dumper')
@@ -1800,6 +1822,7 @@ class BluRayDumperWindow(QMainWindow):
         self.extract_worker = None
         self.batch_compress_worker = None
         self.remux_worker = None
+        self.burner = None
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -1839,7 +1862,7 @@ class BluRayDumperWindow(QMainWindow):
         disc_frame.setFrameStyle(QFrame.Shape.StyledPanel)
         dfl = QVBoxLayout(disc_frame)
         self.disc_info = QLabel('Checking system...')
-        self.disc_info.setStyleSheet('color: #666;')
+        self.disc_info.setStyleSheet('color: #bbb;')
         dfl.addWidget(self.disc_info)
 
         top_row = QHBoxLayout()
@@ -1919,7 +1942,7 @@ class BluRayDumperWindow(QMainWindow):
             'QPushButton { background-color: #4a90d9; color: white; font-size: 16px; '
             'font-weight: bold; padding: 10px; border-radius: 6px; }'
             'QPushButton:hover { background-color: #357abd; }'
-            'QPushButton:disabled { background-color: #aaa; }')
+            'QPushButton:disabled { background-color: #555; }')
         self.dump_btn.clicked.connect(self.start_dump)
         layout.addWidget(self.dump_btn)
 
@@ -1949,57 +1972,72 @@ class BluRayDumperWindow(QMainWindow):
         self.speed_label = QLabel()
         self.speed_label.setVisible(False)
         self.speed_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.speed_label.setStyleSheet('font-size: 14px; color: #555;')
+        self.speed_label.setStyleSheet('font-size: 14px; color: #ccc;')
         timer_speed_row.addWidget(self.speed_label)
         layout.addLayout(timer_speed_row)
 
         self.log_output = QLabel()
-        self.log_output.setWordWrap(True)
-        self.log_output.setStyleSheet(
-            'color: #555; font-style: italic; padding: 4px; '
-            'background-color: #f5f5f5; border-radius: 3px;')
-        self.log_output.setMaximumHeight(60)
-        self.log_output.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(self.log_output)
+        self.log_output.setVisible(False)
 
-        log_btn_layout = QHBoxLayout()
-        self.view_log_btn = QPushButton('View Log')
-        self.view_log_btn.clicked.connect(self.open_log)
-        log_btn_layout.addWidget(self.view_log_btn)
-        log_btn_layout.addStretch()
-        layout.addLayout(log_btn_layout)
-
-        queue_group = QGroupBox('Batch Queue')
-        queue_layout = QVBoxLayout(queue_group)
+        self._queue_expanded = False
+        queue_frame = QFrame()
+        queue_frame.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Sunken)
+        queue_frame.setStyleSheet(
+            'QFrame#queueFrame { background: #333; border: 1px solid #555; border-radius: 4px; }')
+        queue_frame.setObjectName('queueFrame')
+        queue_vl = QVBoxLayout(queue_frame)
+        queue_vl.setContentsMargins(4, 2, 4, 2)
+        queue_vl.setSpacing(2)
+        self._queue_toggle = QPushButton('▶ Batch Queue (0)')
+        self._queue_toggle.setFlat(True)
+        self._queue_toggle.setStyleSheet(
+            'QPushButton { text-align: left; font-weight: bold; padding: 4px 8px; '
+            'color: #bbb; font-size: 12px; border: none; }'
+            'QPushButton:hover { color: #fff; }')
+        self._queue_toggle.clicked.connect(self._toggle_queue)
+        queue_vl.addWidget(self._queue_toggle)
+        self._queue_content = QWidget()
+        qc_layout = QVBoxLayout(self._queue_content)
+        qc_layout.setContentsMargins(0, 0, 0, 0)
         self.queue_list = QListWidget()
         self.queue_list.setAlternatingRowColors(True)
-        queue_layout.addWidget(self.queue_list)
+        self.queue_list.setMaximumHeight(120)
+        qc_layout.addWidget(self.queue_list)
         q_btn_row = QHBoxLayout()
-        self.add_queue_btn = QPushButton('Add Current Disc to Queue')
+        self.add_queue_btn = QPushButton('Add Current')
         self.add_queue_btn.clicked.connect(self.add_to_queue)
         q_btn_row.addWidget(self.add_queue_btn)
-        self.remove_queue_btn = QPushButton('Remove Selected')
+        self.remove_queue_btn = QPushButton('Remove')
         self.remove_queue_btn.clicked.connect(self.remove_from_queue)
         q_btn_row.addWidget(self.remove_queue_btn)
         self.start_queue_btn = QPushButton('Start Queue')
         self.start_queue_btn.setEnabled(False)
         self.start_queue_btn.setStyleSheet(
             'QPushButton { background-color: #4a90d9; color: white; font-weight: bold; '
-            'padding: 6px; border-radius: 4px; }'
+            'padding: 4px; border-radius: 3px; }'
             'QPushButton:disabled { background-color: #aaa; color: #ddd; }')
         self.start_queue_btn.clicked.connect(self.process_queue)
         q_btn_row.addWidget(self.start_queue_btn)
-        queue_layout.addLayout(q_btn_row)
-        layout.addWidget(queue_group)
+        qc_layout.addLayout(q_btn_row)
+        queue_vl.addWidget(self._queue_content)
+        self._activity_label = QPlainTextEdit()
+        self._activity_label.setReadOnly(True)
+        self._activity_label.setMinimumHeight(120)
+        self._activity_label.setMaximumBlockCount(200)
+        self._activity_label.setStyleSheet(
+            'QPlainTextEdit { font-family: monospace; font-size: 11px; padding: 4px 8px; '
+            'color: #ccc; background-color: #1a1a1a; border: 1px solid #444; border-radius: 3px; }')
+        queue_vl.addWidget(self._activity_label)
+        layout.addWidget(queue_frame)
 
         bottom_frame = QFrame()
         bottom_frame.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Sunken)
-        bottom_frame.setStyleSheet('QFrame { background: #f0f0f0; border: 1px solid #ccc; }')
+        bottom_frame.setStyleSheet('QFrame { background: #2b2b2b; border: 1px solid #555; }')
         bottom_layout = QVBoxLayout(bottom_frame)
         bottom_layout.setContentsMargins(6, 1, 6, 1)
         bottom_layout.setSpacing(0)
         self._bottom_quote = QLabel(self._pick_random_quote())
-        self._bottom_quote.setStyleSheet('color: #888; font-style: italic; font-size: 11px;')
+        self._bottom_quote.setStyleSheet('color: #999; font-style: italic; font-size: 11px;')
         bottom_layout.addWidget(self._bottom_quote)
         layout.addWidget(bottom_frame)
 
@@ -2025,6 +2063,9 @@ class BluRayDumperWindow(QMainWindow):
         self.catalog = DiscCatalog()
         self.profile_mgr = ProfileManager()
         self._restore_queue()
+        self._queue_content.setVisible(False)
+        self._activity_label.setPlainText('')
+        self._set_activity('Ready')
 
         missing = check_required_tools()
         if missing:
@@ -2078,6 +2119,48 @@ class BluRayDumperWindow(QMainWindow):
                 + '\n'.join(f'{t}:\n{TOOL_INSTALL.get(t, t)}' for t in missing))
         else:
             self.check_disc()
+
+        self.setStyleSheet('''
+            QMainWindow { background-color: #1e1e1e; color: #ddd; }
+            QGroupBox { color: #ddd; border: 1px solid #555; margin-top: 6px; padding-top: 6px; }
+            QGroupBox::title { color: #ddd; }
+            QLabel { color: #ddd; }
+            QCheckBox { color: #ddd; }
+            QRadioButton { color: #ddd; }
+            QListWidget { background-color: #2b2b2b; color: #ddd; border: 1px solid #555;
+                          alternate-background-color: #333; }
+            QListWidget::item:selected { background-color: #4a90d9; }
+            QTextEdit { background-color: #2b2b2b; color: #ddd; border: 1px solid #555; }
+            QProgressBar { background-color: #333; border: 1px solid #555;
+                           text-align: center; color: #ddd; }
+            QProgressBar::chunk { background-color: #4a90d9; }
+            QComboBox { background-color: #2b2b2b; color: #ddd; border: 1px solid #555;
+                        padding: 2px; }
+            QComboBox::drop-down { border: none; }
+            QComboBox QAbstractItemView { background-color: #2b2b2b; color: #ddd;
+                                          selection-background-color: #4a90d9; }
+            QTableWidget { background-color: #2b2b2b; color: #ddd; border: 1px solid #555; }
+            QHeaderView::section { background-color: #333; color: #ddd; border: 1px solid #555; }
+            QDialog { background-color: #1e1e1e; color: #ddd; }
+            QDialogButtonBox QPushButton { background-color: #3a3a3a; color: #ddd;
+                                            border: 1px solid #555; padding: 4px 12px; }
+            QDialogButtonBox QPushButton:hover { background-color: #4a4a4a; }
+        ''')
+
+        self.log_line.connect(self._on_activity_line)
+        class _LogHandler(logging.Handler):
+            def __init__(self, signal):
+                super().__init__()
+                self.signal = signal
+            def emit(self, record):
+                try:
+                    self.signal.emit(self.format(record))
+                except Exception:
+                    pass
+        lh = _LogHandler(self.log_line)
+        lh.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(message)s'))
+        lh.setLevel(logging.DEBUG)
+        logging.getLogger().addHandler(lh)
 
     def open_log(self):
         viewer = LogViewer(self)
@@ -2224,6 +2307,19 @@ class BluRayDumperWindow(QMainWindow):
             mkv_flag = ' [MKV]' if entry.get('direct_to_mkv') else ''
             self.queue_list.addItem(
                 f'{entry["label"]}{mkv_flag} → {entry["dest"]}')
+        n = len(self.queue)
+        arrow = '▼' if self._queue_expanded else '▶'
+        self._queue_toggle.setText(f'{arrow} Batch Queue ({n})')
+
+    def _toggle_queue(self):
+        self._queue_expanded = not self._queue_expanded
+        self._queue_content.setVisible(self._queue_expanded)
+        self._update_queue_list()
+
+    def _set_activity(self, text):
+        self._activity_label.appendPlainText(text)
+        vbar = self._activity_label.verticalScrollBar()
+        vbar.setValue(vbar.maximum())
 
     def _save_queue(self):
         s = QSettings('BluRayDumper', 'dumper')
@@ -2260,6 +2356,7 @@ class BluRayDumperWindow(QMainWindow):
         self.dest_label.setText(f'Destination: {self.dest_dir}')
         self.disc_info.setText(f'Disc: {self.disc_label}')
         self.status_label.setText(f'Processing: {self.disc_label}')
+        self._set_activity(f'Processing: {self.disc_label}')
         log.info('Queue processing: %s -> %s (MKV=%s)', self.disc_label,
                  self.dest_dir, self.direct_to_mkv)
         self.start_dump()
@@ -2279,6 +2376,8 @@ class BluRayDumperWindow(QMainWindow):
                 self.queue_list.clear()
                 self._save_queue()
                 log.info('Queue cancelled by user')
+        else:
+            self._set_activity('Ready')
 
     def generate_sha256(self, iso_path):
         sha_path = iso_path.with_name(iso_path.name + '.sha256')
@@ -2341,6 +2440,7 @@ class BluRayDumperWindow(QMainWindow):
             return False
 
     def start_dump(self):
+        self._set_activity('Dumping disc...')
         if self._working:
             log.warning('start_dump called while already working')
             return
@@ -2447,8 +2547,14 @@ class BluRayDumperWindow(QMainWindow):
         self.dump_worker.start()
         log.info('Dump started: %s -> %s', self.device_path, dump_path)
 
+    def _on_activity_line(self, line):
+        stripped = line.strip()
+        if stripped:
+            self._set_activity(stripped)
+
     def on_dump_output(self, line):
         self.log_output.setText(line[-80:])
+        self._on_activity_line(line)
 
     def _on_encode_progress(self, pct, speed_text):
         self.progress_bar.setValue(pct)
@@ -2462,6 +2568,12 @@ class BluRayDumperWindow(QMainWindow):
             if m:
                 self._disc_widget.set_speed(float(m.group(1)))
         self.speed_label.setText(label)
+        tag = ''
+        if self.compress_target == 'dvd5':
+            tag = ' [DVD-5]'
+        elif self.compress_target == 'dvd9':
+            tag = ' [DVD-9]'
+        self._set_activity(f'{pct}%{tag}  |  ETA {str(timedelta(seconds=eta_s)) if self.elapsed > 0 and pct > 0 else "?"}  |  {speed_text or ""}')
 
     def update_progress(self):
         if not self._dump_path or not self._dump_path.exists():
@@ -2519,6 +2631,7 @@ class BluRayDumperWindow(QMainWindow):
             if coverage >= 80 and actual > 0:
                 self.progress_bar.setValue(min(int(coverage), 100))
                 self.status_label.setText('Dump complete (with warnings)')
+                self._set_activity('Dump complete (with warnings)')
                 self.log_output.setText(
                     'bluraybackup reported minor errors but most data was copied.')
                 self._working = False
@@ -2549,6 +2662,7 @@ class BluRayDumperWindow(QMainWindow):
 
             self.progress_bar.setValue(0)
             self.status_label.setText('Dump failed')
+            self._set_activity('Dump failed')
             msg = error or f'bluraybackup exited with code {retcode}'
             self.log_output.setText(f'Error: {msg}')
             self._working = False
@@ -2561,6 +2675,7 @@ class BluRayDumperWindow(QMainWindow):
 
         self.progress_bar.setValue(100)
         self.status_label.setText('Dump complete')
+        self._set_activity('Dump complete')
         self.log_output.setText('Disc dumped successfully.')
         self._working = False
         self.reset_buttons()
@@ -2638,6 +2753,7 @@ class BluRayDumperWindow(QMainWindow):
                 return
 
         self._disc_widget.set_mode('writing')
+        self._set_activity('Creating ISO...')
         self._enter_working_state(indeterminate=True, status_text='Creating ISO...',
                                   log_text='Creating ISO with UDF filesystem...',
                                   speed_text='Creating ISO...')
@@ -2650,6 +2766,7 @@ class BluRayDumperWindow(QMainWindow):
 
     def on_iso_output(self, line):
         self.log_output.setText(line[-80:])
+        self._on_activity_line(line)
 
     def on_iso_finished(self, retcode, error):
         if self._cancelled:
@@ -2738,6 +2855,7 @@ class BluRayDumperWindow(QMainWindow):
         self.mount_iso_verify(self.iso_path)
 
         self.status_label.setText('ISO verified')
+        self._set_activity('ISO verified')
 
         sha_note = f'\nSHA256: {sha_path.name}' if sha_path else ''
 
@@ -2789,6 +2907,7 @@ class BluRayDumperWindow(QMainWindow):
 
     def _post_iso_mismatch(self, iso_size, dump_size):
         self.status_label.setText('Size mismatch')
+        self._set_activity('ISO size mismatch')
         self.log_output.setText('ISO size does not match dump size.')
         QMessageBox.warning(
             self, 'Size Mismatch',
@@ -2825,6 +2944,7 @@ class BluRayDumperWindow(QMainWindow):
         self.iso_path = None
         self._last_sha256 = ''
         self.status_label.setText('Ready')
+        self._set_activity('Ready')
         self.disc_info.setText('No disc data. Insert a disc or select a destination.')
         self.log_output.setText('')
         self.dest_label.setText('Destination: not selected')
@@ -2936,6 +3056,7 @@ class BluRayDumperWindow(QMainWindow):
         return TARGET_SIZES.get(target, 0)
 
     def start_compress(self, target_bytes):
+        self._set_activity('Compressing video...')
         if self._working:
             log.warning('start_compress called while already working')
             return
@@ -2972,6 +3093,7 @@ class BluRayDumperWindow(QMainWindow):
         self._enter_working_state(indeterminate=False, status_text='Remuxing to MKV...',
                                   log_text='Remuxing main movie (direct copy, no re-encode)...',
                                   show_speed=True)
+        self._set_activity('Remuxing to MKV...')
         self.remux_worker = RemuxWorker(str(self._dump_path), str(out_path))
         self.remux_worker.finished.connect(self.on_remux_finished)
         self.remux_worker.output_line.connect(self.on_dump_output)
@@ -3021,10 +3143,17 @@ class BluRayDumperWindow(QMainWindow):
             self.remux_worker.stop()
             self.remux_worker.wait(5000)
 
+        if self.burner and self.burner.isRunning():
+            self.burner.stop()
+            self.burner.wait(5000)
+            self.burner = None
+
         if hasattr(self, '_batch_compress_queue'):
             self._batch_compress_queue = []
 
         self._working = False
+        self._disc_widget.set_mode('idle')
+        self._disc_widget.set_speed(0)
         self.reset_buttons()
         self.status_label.setText('Cancelled')
         self.log_output.setText('Operation cancelled.')
@@ -3257,6 +3386,7 @@ class BluRayDumperWindow(QMainWindow):
 
         if retcode != 0:
             self.status_label.setText('Compression failed')
+            self._set_activity('Compression failed')
             ename = getattr(self.compress_worker, 'encoder_name', 'encoder')
             msg = error or f'{ename} exited with code {retcode}'
             self.log_output.setText(f'Compression failed: {msg}')
@@ -3268,6 +3398,7 @@ class BluRayDumperWindow(QMainWindow):
             if not mkv_path.is_file() or mkv_path.stat().st_size < 10 * 1024 * 1024:
                 log.error('Compression reported success but no valid output at %s', mkv_path)
                 self.status_label.setText('Compression failed')
+                self._set_activity('Compression failed')
                 self.log_output.setText(
                     'Encoder reported success but created no output.\n'
                     'The size target may not be supported by this version.')
@@ -3278,6 +3409,7 @@ class BluRayDumperWindow(QMainWindow):
                 return
 
             self.status_label.setText('Compression complete')
+            self._set_activity('Compression complete')
             self.log_output.setText('Compressed MKV created.')
 
             if tool_available('ffmpeg') and self._is_dvd_target(self.compress_target):
@@ -3310,6 +3442,7 @@ class BluRayDumperWindow(QMainWindow):
 
         if retcode != 0:
             self.status_label.setText('Remux failed')
+            self._set_activity('Remux failed')
             msg = error or f'ffmpeg exited with code {retcode}'
             self.log_output.setText(f'Remux failed: {msg}')
             QMessageBox.critical(self, 'Remux Failed',
@@ -3319,12 +3452,14 @@ class BluRayDumperWindow(QMainWindow):
             mkv_path = Path(self.remux_worker.output_path)
             if not mkv_path.is_file() or mkv_path.stat().st_size < 1024 * 1024:
                 self.status_label.setText('Remux failed')
+                self._set_activity('Remux failed')
                 self.log_output.setText('Output MKV is empty or missing.')
                 QMessageBox.critical(self, 'Remux Failed',
                     'ffmpeg reported success but output is missing or too small.')
                 log.error('Remux produced no valid output at %s', mkv_path)
             else:
                 self.status_label.setText('Remux complete')
+                self._set_activity('Remux complete')
                 self.log_output.setText(f'MKV created: {mkv_path.name}')
                 QMessageBox.information(self, 'Remux Complete',
                     f'MKV saved as:\n{mkv_path}')
@@ -3334,6 +3469,26 @@ class BluRayDumperWindow(QMainWindow):
         self._finish_after_compress()
         self.queue_next()
 
+    def _verify_avchd_iso(self, iso_path):
+        rc, out, err = self._run_subprocess_streaming(
+            ['blkid', '-p', '-o', 'value', '-s', 'VERSION', str(iso_path)],
+            label='udf_verify', line_callback=self._on_activity_line)
+        ver = out.strip() if rc == 0 else ''
+        log.info('AVCHD ISO UDF version: %s', ver)
+        if '2.50' not in ver:
+            log.error('Expected UDF 2.50, got %s', ver)
+            return False
+        rc2, out2, _ = self._run_subprocess_streaming(
+            ['rg', '-c', 'BDMV/index.bdmv', str(iso_path)],
+            label='iso_verify', line_callback=self._on_activity_line)
+        rc3, out3, _ = self._run_subprocess_streaming(
+            ['rg', '-c', '00000.m2ts', str(iso_path)],
+            label='iso_verify_m2ts', line_callback=self._on_activity_line)
+        ok = (rc2 == 0) and (rc3 == 0)
+        if not ok:
+            log.warning('ISO missing BDMV/index.bdmv or 00000.m2ts')
+        return ok
+
     def _offer_dvd_output(self, mkv_path):
         dlg = QDialog(self)
         dlg.setWindowTitle('DVD Output Format')
@@ -3342,8 +3497,8 @@ class BluRayDumperWindow(QMainWindow):
             f'Compressed video ready at:\n{mkv_path.name}\n\n'
             'Choose output format:'))
         self._dvd_mkv_rb = QRadioButton('MKV — keep as-is')
-        self._dvd_avchd_rb = QRadioButton('AVCHD ISO — HD on DVD (plays on PS3/PS4/Blu-ray players)')
-        self._dvd_vob_rb = QRadioButton('DVD-SDVIDEO ISO — standard definition DVD (plays on standard DVD players)')
+        self._dvd_avchd_rb = QRadioButton('AVCHD ISO — UDF 2.50, BDMV structure (HD video on DVD)')
+        self._dvd_vob_rb = QRadioButton('DVD-Video ISO — MPEG-2 SD, dvdauthor-authored (widest player compat)')
         self._dvd_mkv_rb.setChecked(True)
         layout.addWidget(self._dvd_mkv_rb)
         layout.addWidget(self._dvd_avchd_rb)
@@ -3400,36 +3555,36 @@ class BluRayDumperWindow(QMainWindow):
         QMessageBox.information(self, 'Complete', msg)
 
     @staticmethod
-    def _run_subprocess_streaming(cmd, timeout=3600, label='process'):
-        result = [None]
-        exc = [None]
-        def _run():
-            try:
-                result[0] = subprocess.run(
-                    cmd, capture_output=True, text=True, timeout=timeout)
-            except Exception as e:
-                exc[0] = e
-        thread = threading.Thread(target=_run, daemon=True)
-        thread.start()
-        while thread.is_alive():
-            thread.join(0.05)
-            QApplication.processEvents()
-        if exc[0] is not None:
-            raise exc[0]
-        r = result[0]
-        if r.returncode != 0:
-            log.error('%s failed (code=%d): stdout=%s, stderr=%s',
-                      label, r.returncode,
-                      r.stdout[-500:] if r.stdout else '',
-                      r.stderr[-500:] if r.stderr else '')
+    def _run_subprocess_streaming(cmd, timeout=3600, label='process', line_callback=None):
+        stdout_lines = []
+        process = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1)
+        try:
+            for line in iter(process.stdout.readline, ''):
+                line = line.rstrip('\n\r')
+                stdout_lines.append(line)
+                if line_callback:
+                    line_callback(line)
+                QApplication.processEvents()
+            process.stdout.close()
+        except Exception as e:
+            process.kill()
+            raise e
+        process.wait()
+        stdout = '\n'.join(stdout_lines)
+        if process.returncode != 0:
+            log.error('%s failed (code=%d): stdout=%s',
+                      label, process.returncode,
+                      stdout[-500:] if stdout else '')
         else:
-            log.debug('%s succeeded (code=0): stdout=%s, stderr=%s',
+            log.debug('%s succeeded (code=0): stdout=%s',
                       label,
-                      r.stdout[-200:] if r.stdout else '',
-                      r.stderr[-200:] if r.stderr else '')
-        return r.returncode, r.stdout, r.stderr
+                      stdout[-200:] if stdout else '')
+        return process.returncode, stdout, ''
 
     def _create_avchd_iso(self, mkv_path):
+        self._set_activity('Creating AVCHD DVD ISO...')
         self._disc_widget.set_mode('writing')
         self.status_label.setText('Creating AVCHD DVD...')
         self.log_output.setText('Remuxing with ffmpeg...')
@@ -3458,7 +3613,7 @@ class BluRayDumperWindow(QMainWindow):
         rc, out, err = self._run_subprocess_streaming(
             ['ffmpeg', '-i', str(mkv_path), '-c:v', 'copy', '-c:a', 'ac3', '-b:a', '448k',
              '-f', 'mpegts', '-mpegts_m2ts_mode', '1', '-y', str(m2ts_path)],
-            label='ffmpeg_m2ts')
+            label='ffmpeg_m2ts', line_callback=self._on_activity_line)
         if rc != 0:
             err_msg = (err[-500:] if err else 'unknown error').strip()
             self.status_label.setText('AVCHD remux failed')
@@ -3515,10 +3670,10 @@ class BluRayDumperWindow(QMainWindow):
         blocks = (total_size + 2047) // 2048
 
         rc, out, err = self._run_subprocess_streaming(
-            ['mkudffs', '--media-type', 'hd', '--udfrev', '2.01',
+            ['mkudffs', '--media-type', 'dvd', '--udfrev', '2.50',
              '--label', vol_id, '--blocksize', '2048',
              str(iso_path), str(blocks)],
-            label='mkudffs')
+            label='mkudffs', line_callback=self._on_activity_line)
         if rc != 0:
             err_msg = (err[-500:] if err else 'unknown error').strip()
             self.status_label.setText('AVCHD ISO failed')
@@ -3557,7 +3712,8 @@ class BluRayDumperWindow(QMainWindow):
             os.chmod(script_path, 0o755)
 
             rc2, out2, err2 = self._run_subprocess_streaming(
-                ['pkexec', script_path], label='isopopulate')
+                ['pkexec', script_path], label='isopopulate',
+                line_callback=self._on_activity_line)
             if rc2 != 0:
                 err_msg = (err2[-500:] if err2 else 'populate failed').strip()
                 self.status_label.setText('AVCHD ISO failed')
@@ -3571,8 +3727,17 @@ class BluRayDumperWindow(QMainWindow):
                 os.unlink(script_path)
 
         shutil.rmtree(avchd_dir, ignore_errors=True)
+        self._set_activity('Verifying AVCHD ISO...')
+        self.log_output.setText('Verifying populated ISO...')
+        QApplication.processEvents()
+        if not self._verify_avchd_iso(iso_path):
+            log.warning('AVCHD ISO verification failed for %s', iso_path)
+            QMessageBox.warning(self, 'ISO Warning',
+                'ISO verification found issues.\n'
+                'The disc may not play. Try creating a DVD-Video instead.')
         self._current_dvd_workdir = str(avchd_dir)
         self.status_label.setText('AVCHD DVD ISO created')
+        self._set_activity('AVCHD DVD ISO created')
         self.log_output.setText(f'Created: {iso_path.name}')
         self._burn_iso_dialog(iso_path)
         log.info('AVCHD ISO created: %s', iso_path)
@@ -3595,6 +3760,7 @@ class BluRayDumperWindow(QMainWindow):
 
     def _create_dvd_video_iso(self, mkv_path):
         self._disc_widget.set_mode('writing')
+        self._set_activity('Creating DVD-Video...')
         self.status_label.setText('Creating DVD-Video...')
         self.log_output.setText('Encoding to DVD-compatible MPEG-2...')
         QApplication.processEvents()
@@ -3613,10 +3779,11 @@ class BluRayDumperWindow(QMainWindow):
              '-b:v', '8M', '-maxrate', '9M', '-bufsize', '2M',
              '-c:a', 'ac3', '-ac', '2', '-b:a', '448k',
              '-f', 'dvd', '-y', str(mpg_path)],
-            label='ffmpeg_dvd')
+            label='ffmpeg_dvd', line_callback=self._on_activity_line)
         if rc != 0:
             err_msg = (err[-500:] if err else 'unknown error').strip()
             self.status_label.setText('DVD encode failed')
+            self._set_activity('DVD encode failed')
             self.log_output.setText(err_msg)
             QMessageBox.critical(self, 'DVD Error',
                 f'MPEG-2 encoding failed (code {rc}):\n{err_msg}')
@@ -3624,6 +3791,7 @@ class BluRayDumperWindow(QMainWindow):
             return
 
         if tool_available('dvdauthor'):
+            self._set_activity('Authoring DVD-Video...')
             self.status_label.setText('Authoring DVD-Video...')
             self.log_output.setText('Running dvdauthor...')
             QApplication.processEvents()
@@ -3634,7 +3802,7 @@ class BluRayDumperWindow(QMainWindow):
                 ['ffmpeg', '-f', 'lavfi', '-i', 'color=c=black:s=' + dvd_size + ':d=0.04',
                  '-c:v', 'mpeg2video', '-frames:v', '1',
                  '-b:v', '1M', '-y', str(vmgm_mpg)],
-                timeout=120, label='ffmpeg_vmgm')
+                timeout=120, label='ffmpeg_vmgm', line_callback=self._on_activity_line)
             xml = (
                 '<?xml version="1.0" encoding="UTF-8"?>\n'
                 f'<dvdauthor dest="{dvd_dir}">\n'
@@ -3658,10 +3826,11 @@ class BluRayDumperWindow(QMainWindow):
             xml_path.write_text(xml)
             rc3, out3, err3 = self._run_subprocess_streaming(
                 ['dvdauthor', '-x', str(xml_path)],
-                timeout=300, label='dvdauthor')
+                timeout=300, label='dvdauthor', line_callback=self._on_activity_line)
             if rc3 != 0:
                 err_msg = (err3[-500:] if err3 else 'unknown error').strip()
                 self.status_label.setText('DVD authoring failed')
+                self._set_activity('DVD authoring failed')
                 self.log_output.setText(err_msg)
                 QMessageBox.critical(self, 'DVD Error',
                     f'dvdauthor failed (code {rc3}):\n{err_msg}\n\n'
@@ -3684,14 +3853,17 @@ class BluRayDumperWindow(QMainWindow):
             iso_cmd = ['genisoimage', '-udf', '-o']
 
         iso_path = dvd_dir.parent / f'{name_stem}_dvd.iso'
+        self._set_activity('Creating DVD ISO...')
         self.log_output.setText('Creating DVD ISO...')
         QApplication.processEvents()
         rc4, out4, err4 = self._run_subprocess_streaming(
             iso_cmd + [str(iso_path), str(dvd_dir)],
-            timeout=3600, label='genisoimage_dvd')
+            timeout=3600, label='genisoimage_dvd',
+            line_callback=self._on_activity_line)
         if rc4 != 0:
             err_msg = (err4[-500:] if err4 else 'unknown error').strip()
             self.status_label.setText('DVD ISO failed')
+            self._set_activity('DVD ISO failed')
             self.log_output.setText(err_msg)
             QMessageBox.critical(self, 'DVD Error',
                 f'ISO creation failed (code {rc4}):\n{err_msg}')
@@ -3701,6 +3873,7 @@ class BluRayDumperWindow(QMainWindow):
         shutil.rmtree(dvd_dir, ignore_errors=True)
         self._current_dvd_workdir = str(dvd_dir)
         self.status_label.setText('DVD-Video ISO created')
+        self._set_activity('DVD-Video ISO created')
         self.log_output.setText(f'Created: {iso_path.name}')
         self._burn_iso_dialog(iso_path)
         log.info('DVD-Video ISO created: %s', iso_path)
@@ -3728,6 +3901,7 @@ class BluRayDumperWindow(QMainWindow):
             self._run_wodim_burn(iso_path)
 
     def _run_wodim_burn(self, iso_path):
+        self._set_activity('Burning DVD...')
         self._disc_widget.set_mode('writing')
         self._disc_widget.set_speed(0)
         self.status_label.setText('Burning DVD...')
@@ -3739,19 +3913,38 @@ class BluRayDumperWindow(QMainWindow):
             return
         device = dev[0].strip()
         burner = BurnWorker(self, iso_path, device)
+        self.burner = burner
         burner.finished.connect(
             lambda ok, path: self._on_burn_finished(ok, path))
+        burner.output_line.connect(self._on_activity_line)
+        burner.progress_updated.connect(self._on_burn_progress)
+        burner.speed_updated.connect(self._on_burn_speed)
         burner.start()
+
+    def _on_burn_progress(self, pct):
+        self.status_label.setText(f'Burning DVD... {pct}%')
+        self._disc_widget.set_speed(pct)
+        pass
+
+    def _on_burn_speed(self, speed):
+        self.status_label.setText(f'Burning DVD... {speed}x')
+        pass
 
     def _on_burn_finished(self, ok, iso_path):
         self._disc_widget.set_mode('idle')
         self._disc_widget.set_speed(0)
         if ok:
+            self.status_label.setText('Burn complete')
+            self._set_activity('Burn complete')
+            self.log_output.setText(f'Burned: {iso_path.name}')
+            if getattr(self, '_pending_auto_eject', False):
+                self.eject_disc()
             QMessageBox.information(
                 self, 'Burn Complete',
                 f'ISO burned successfully:\n{iso_path}\n\n'
                 'Verify playback on your set-top player.')
         else:
+            self._set_activity('Burn failed')
             QMessageBox.critical(
                 self, 'Burn Failed',
                 f'Failed to burn:\n{iso_path}\n\n'
@@ -3791,6 +3984,7 @@ class BluRayDumperWindow(QMainWindow):
                 sanitize_filename(self._dump_path.name) + '_extracted')
             extract_dir.mkdir(parents=True, exist_ok=True)
             self._disc_widget.set_mode('writing')
+            self._set_activity('Extracting streams...')
             self._enter_working_state(show_progress=False, show_timer=False,
                                       show_speed=False,
                                       status_text='Extracting...',
@@ -3811,11 +4005,13 @@ class BluRayDumperWindow(QMainWindow):
         if retcode == 0:
             extract_dir = Path(self.extract_worker.output_dir) if hasattr(self.extract_worker, 'output_dir') else ''
             self.status_label.setText('Extraction complete')
+            self._set_activity('Extraction complete')
             self.log_output.setText('Streams extracted successfully.')
             QMessageBox.information(self, 'Extraction Done',
                                     f'Streams extracted to:\n{extract_dir}')
         else:
             self.status_label.setText('Extraction failed')
+            self._set_activity('Extraction failed')
             self.log_output.setText(f'Extraction error: {error}')
             QMessageBox.critical(self, 'Extraction Failed', error)
 
